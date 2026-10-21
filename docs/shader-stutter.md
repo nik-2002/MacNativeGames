@@ -85,9 +85,26 @@ The default bind state is the one most shaders are drawn with. Of the bind state
 players recorded for Breath of the Wild, 83.4% are the default one, so preparing
 every shader for it removes the translation from most first meetings.
 
+Measured on the 1.6.0 game data:
+
+| | before | after |
+|---|---:|---:|
+| shaders discovered in the game files | 19,727 | 19,690 |
+| prepared for the default bind state | 9,953 | 19,690 |
+| prepared variants in the seed | 11,148 | 21,389 |
+| of those from the shared list | 1,718 | 11,659 |
+| failures | 44 | 44 |
+| time to prepare | 40 s | 127 s |
+| files in the seed | 33,160 | 60,350 |
+
+(The 37 shaders less are the ones in the game module that a patch to the module
+changed; the measurement ran against an already patched module, a build from the
+original files finds them all.)
+
 A prepared shader that is not a startup one is not warmed (no row in the warm
 list): the runtime builds that pipeline when the draw needs it, which costs a
-fraction of a millisecond, while the library itself comes from the app.
+fraction of a millisecond, while the library itself comes from the app. The warm
+list grows from 11,148 to 11,659 rows, not to 21,389.
 
 ### 3. The shared shader list carries what players met
 
