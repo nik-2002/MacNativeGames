@@ -2,10 +2,12 @@
 """Prepare game shaders from the selected, verified local RomFS, without a played cache.
 
 Every shader in the RomFS is found (Shader/ packages, SDK and boot packages, and the ones effects and UI layouts carry).
-The startup shaders (Shader/, SDK, boot) are translated for the default bind state; then every bind state the shared
-shader list (assets/shader_list.tsv, docs/shader-list.md) names for a shader of this game is translated too, so an
-iPhone or iPad, which cannot translate while playing, carries what players have met. The output contains game-derived
-data and belongs in the work folder, never in the repo.
+Every one of them is translated for the default bind state: a shader met for the first time in the world is otherwise
+translated while the game is running, and that translation is the hitch the player sees. The startup shaders (Shader/,
+SDK, boot) are the ones the title screen and the menus need, and the only ones whose pipelines are warmed. Then every
+bind state the shared shader list (assets/shader_list.tsv, docs/shader-list.md) names for a shader of this game is
+translated too, so an iPhone or iPad, which cannot translate while playing, carries what players have met. The output
+contains game-derived data and belongs in the work folder, never in the repo.
 
 Breath of the Wild (game='botw', games/botw/scripts/prepare_shader_seed.py): the same, with its own list and container
 formats (Yaz0 instead of Zstandard, no dictionaries), its shaders in Pack/ (the boot packages' uking_*.sbfsha and the
@@ -419,10 +421,19 @@ def source_reader(romfs, modules, game='totk'):
 
 
 def plan(shaders, startup, listed):
-    """Translation jobs (key, answers, variant, why): the default bind state for every startup shader, then each bind
-    state the shared list names for a shader found in this game ('listed'). Listed states the default already produced
-    are dropped after translation (prepare), since only the translator knows a shader's deps."""
-    jobs = [(key, ANSWERS, key+'-'+SUFFIX, 'default') for key in sorted(startup)]
+    """Translation jobs (key, answers, variant, why): the default bind state for every shader the game files hold
+    ('default' for the startup ones, 'discovered' for the rest), then each bind state the shared list names for a
+    shader found in this game ('listed'). Listed states the default already produced are dropped after translation
+    (prepare), since only the translator knows a shader's deps.
+
+    A shader met for the first time in the world is translated while the game runs, and that translation is what the
+    player sees as a hitch. The default bind state is the one most of them are drawn with: of the bind states players
+    recorded for Breath of the Wild, 83% are the default one. So every shader is prepared for it, not only the
+    startup ones, which are the shaders the title screen and the menus need.
+
+    A 'discovered' variant is not warmed (it gets no row in the warm list): the runtime builds that pipeline when the
+    draw needs it, which costs a fraction of a millisecond, while the library itself comes from the app."""
+    jobs = [(key, ANSWERS, key+'-'+SUFFIX, 'default' if key in startup else 'discovered') for key in sorted(shaders)]
     for key, deps in sorted(listed):
         if key in shaders:
             answers = {**ANSWERS, **json.loads(deps)}
@@ -481,11 +492,19 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
                     return
                 key, indices = item
                 mine = {}
+                warmed = set()   # the variants of this shader that already have a warm row
                 for index in indices:
                     _, answers, variant, why = jobs[index]
                     stage, control, code, source = shaders[key]
                     if why == 'listed' and json.dumps(answers, sort_keys=True, separators=(',', ':')) in mine:
-                        continue   # the default (or an earlier row) already gave exactly these deps
+                        # the default (or an earlier row) already gave exactly these deps: the variant is there,
+                        # and a listed variant is warmed
+                        same = mine[json.dumps(answers, sort_keys=True, separators=(',', ':'))]
+                        if same not in warmed:
+                            warmed.add(same)
+                            outcome[index] = ('ok', same, [f'S\t{same}_b\t'+str({'vs': 0, 'ps': 1, 'cs': 5}[stage])]
+                                               + ([f'C\t{same}_b'] if stage == 'cs' else []))
+                        continue
                     c1, length = struct.unpack_from('<II', control, 0x700)
                     code_path = staging/(variant+'.code')
                     code_path.write_bytes(code[0 if stage == 'cs' else 0x30:length])
@@ -507,13 +526,22 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
                         if deps in mine:   # same deps as a variant already made: keep one
                             for name in (variant+'_b.metal', variant+'_b.json'):
                                 (staging/name).unlink(missing_ok=True)
+                            same = mine[deps]
+                            if why != 'discovered' and same not in warmed:
+                                warmed.add(same)
+                                outcome[index] = ('ok', same, [f'S\t{same}_b\t'+str({'vs': 0, 'ps': 1, 'cs': 5}[stage])]
+                                                   + ([f'C\t{same}_b'] if stage == 'cs' else []))
                             continue
                         mine[deps] = variant
                         (staging/(key+'.variants')).write_text(json.dumps([dict(variant=v, deps=json.loads(d)) for d, v in
                                                                            mine.items()], separators=(',', ':'))+'\n')
-                        rows = [f'S\t{variant}_b\t'+str({'vs': 0, 'ps': 1, 'cs': 5}[stage])]
-                        if stage == 'cs':
-                            rows.append(f'C\t{variant}_b')
+                        rows = []
+                        if why != 'discovered':   # a discovered variant is not warmed: its pipeline is built when the
+                            # draw needs it, and that costs a fraction of a millisecond
+                            rows = [f'S\t{variant}_b\t'+str({'vs': 0, 'ps': 1, 'cs': 5}[stage])]
+                            if stage == 'cs':
+                                rows.append(f'C\t{variant}_b')
+                            warmed.add(variant)
                         outcome[index] = ('ok', variant, rows)
                     else:
                         outcome[index] = ('failed', dict(key=key, variant=variant, why=why, stage=stage, source=source,
@@ -562,15 +590,16 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
     # ships a name the runtime's strict filename check (totk_shader_seed.h) would reject.
     wanted_final = wanted | {'pso_manifest.tsv', 'shader-keys.json'}
     report = dict(**identity, shaders=len(completed), discovered=len(shaders), located=len(extra), startup_shaders=ready,
-                  listed_variants=sum(1 for _, _, _, why in jobs if why == 'listed'), skipped=failed,
+                  listed_variants=sum(1 for _, _, _, why in jobs if why == 'listed'),
+                  discovered_variants=sum(1 for _, _, _, why in jobs if why == 'discovered'), skipped=failed,
                   archives=archives, seconds=time.monotonic()-started,
                   files={p.name: digest(p.read_bytes()) for p in sorted(staging.iterdir()) if p.name in wanted_final})
     (staging/'seed-manifest.json').write_text(json.dumps(report, indent=2)+'\n')
     if output.exists():
         shutil.rmtree(output)
     staging.rename(output)
-    print(f'startup seed ready: {len(completed)} shader variants ({ready} startup shaders, the rest from the shared list), '
-          f'{len(failed)} skipped', flush=True)
+    print(f'startup seed ready: {len(completed)} shader variants ({ready} startup shaders, the rest the other shaders of '
+          f'this game and the shared list), {len(failed)} skipped', flush=True)
     return report
 
 

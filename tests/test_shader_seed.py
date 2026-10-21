@@ -136,7 +136,10 @@ class ShaderInventory(unittest.TestCase):
         # every startup shader gets the default bind state first; listed states follow, only for shaders found here
         self.assertEqual([(k[0], json.dumps(a, sort_keys=True), why) for k, a, _, why in jobs[:1]],
                          [('a', json.dumps(seed.ANSWERS, sort_keys=True), 'default')])
-        self.assertEqual(sorted((k[0], why) for k, _, _, why in jobs), [('a', 'default'), ('a', 'listed'), ('b', 'listed')])
+        # every shader of this game gets the default bind state, the startup ones as 'default' and the rest as
+        # 'discovered': a shader met for the first time in the world is otherwise translated while the game runs
+        self.assertEqual(sorted((k[0], why) for k, _, _, why in jobs),
+                         [('a', 'default'), ('a', 'listed'), ('b', 'discovered'), ('b', 'listed')])
         for key, answers, variant, _ in jobs:
             self.assertEqual(set(answers), {'tex', 'img', 'attr', 'fout'})
             self.assertEqual(variant, key+'-'+seed.suffix(answers))
@@ -182,6 +185,8 @@ class ShaderKeyScope(unittest.TestCase):
     def test_preparation_keeps_untranslated_and_located_keys_and_rebuilds_old_seed(self):
         # A tiny service prepares one startup shader. The other inventory shader and verified locator need no startup
         # variant but still belong to this game; filtering by the translated seed would incorrectly lose their cache.
+        # All three get their default bind state prepared: the two that are not startup shaders are 'discovered' and
+        # are not warmed, so the warm list holds the startup ones and the listed ones only.
         class Service:
             def __init__(self, *args, **kwargs):
                 self.stdin = self.stdout = self
@@ -215,7 +220,12 @@ class ShaderKeyScope(unittest.TestCase):
                 manifest = seed.prepare(romfs, output, translator, cross, '1.2.1', shared)
                 scope = json.loads((output/'shader-keys.json').read_text())
                 self.assertEqual(scope['keys'], sorted(row[0] for row in rows))
-                self.assertEqual((manifest['shaders'], manifest['discovered'], manifest['located']), (1, 3, 1))
+                # every shader of this game is prepared for the default bind state, not only the startup one
+                self.assertEqual((manifest['shaders'], manifest['discovered'], manifest['located']), (3, 3, 1))
+                self.assertEqual(manifest['discovered_variants'], 2)
+                # only the startup shader and the listed ones are warmed
+                warm = (output/'pso_manifest.tsv').read_text().splitlines()
+                self.assertEqual([row for row in warm if row.startswith('S\t')], [f'S\t{rows[0][0]}-{seed.SUFFIX}_b\t0'])
                 self.assertEqual(manifest['files']['shader-keys.json'], seed.digest((output/'shader-keys.json').read_bytes()))
                 self.assertEqual(seed.prepare(romfs, output, translator, cross, '1.2.1', shared), manifest)
                 self.assertEqual(inventory.call_count, 1)
