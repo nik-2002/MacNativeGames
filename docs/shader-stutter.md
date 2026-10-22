@@ -101,10 +101,22 @@ Measured on the 1.6.0 game data:
 changed; the measurement ran against an already patched module, a build from the
 original files finds them all.)
 
-A prepared shader that is not a startup one is not warmed (no row in the warm
-list): the runtime builds that pipeline when the draw needs it, which costs a
-fraction of a millisecond, while the library itself comes from the app. The warm
-list grows from 11,148 to 11,659 rows, not to 21,389.
+A prepared shader that is not a startup one used to get no row in the warm list: the
+runtime builds that pipeline when the draw needs it, which costs a fraction of a
+millisecond, while the library itself comes from the app. That was not enough: the
+warm-up did not load the library, and the driver compiles the AIR of a library it has
+never seen (about 0.1 s) the first time the game draws with it. The first visit to a
+region logged 1,362 ms with 9 shader libraries.
+
+Every prepared variant is warmed now (commit `3db0685`):
+
+| | before | after |
+|---|---:|---:|
+| warm rows | 11,659 | 20,351 |
+| warm-up time | 9.2 s | 13.7 s |
+| render pipelines the warm-up builds | 8,543 | 11,045 |
+
+The first frame still waits only for the title list (20 ms).
 
 ### 3. The shared shader list carries what players met
 
@@ -116,16 +128,49 @@ of play.
 The list is the channel that works without anyone writing code: play, and send
 the file the game writes (see [the shared shader list](shader-list.md)).
 
+## What upstream does about the same hitch (2026-10-22)
+
+Upstream worked on this area in parallel and much of it is now in this branch
+(`bc461fc` and the commits before it):
+
+| Upstream | What it does | How it meets this page |
+|---|---|---|
+| `27baca0`, `ea6c5a7`, `6446e09` | A pipeline archive: the compiled GPU code of a pipeline is kept on disk, one file per pipeline, and the game takes it from there | The pipeline was never the problem (a fraction of a millisecond); the archive saves the *library* compiles on later runs. |
+| `bfdd085`, `bc461fc` | New shaders are translated on background threads, and the shaders that cannot wait are prepared at once, in parallel | Removes the translation from the submit thread, which is where this page's hitch happens. |
+| `852f862` | The patched variants (sampler border colours, missing varyings) are compiled into the app with the startup shaders | The same fix as fix 1, for the variants the runtime rewrites. |
+| `b06c88d` | The border-colour pipelines are warmed from the recipes the game recorded | The warm list learns to carry them. |
+| `prepare_shader_seed.py` | The preparation keeps an inventory of the RomFS's shaders and a cache of the translations beside the seed folder | A preparation that runs again after the list grew translates only the new bind states. It is kept as it is here. |
+
+Two of the upstream changes are worth naming, because they are the trade this
+repository's rules do not allow silently:
+
+- `311f7ec` skips a draw inside an occlusion count while its shader is prepared
+  (the count it leaves at 0 is reported as 1).
+- `b06c88d` draws a border-colour pipeline with the plain pipeline (whose samplers
+  clamp to the edge) until the real one is ready.
+
+Both put a frame on screen before every draw of it is right, which the rule in
+`CONTRIBUTING.md` ("the picture must be correct before it is fast") does not allow
+on the Mac. Upstream keeps them behind `TOTK_OCCL_SKIP=0`, `TOTK_BORDER_PLAIN=0`
+and `TOTK_ASYNC_SHADERS=0`, so they can be off.
+
 ## What is left
 
 - A shader whose bind state is neither the default one nor one the list names is
   still translated and compiled at first use. 16.6% of the recorded bind states are
-  not the default one.
+  not the default one. Upstream's background translation moves that work off the
+  submit thread, but the draw is then drawn without it (or later), which is the
+  trade named above.
 - The Metal libraries are built for the GPU family of the machine that built them.
   A different Mac compiles its own.
 - macOS's own cache of compiled libraries is keyed in part by the length of the
   program's path, is a fixed size, and is emptied when the disk fills. The app's
   own `shader-libs` folder does not have those problems.
+- The numbers above were measured before upstream's parallel work was merged here.
+  They are the reference for the shader side of the stutter, not for the pipeline
+  side: the pipeline archive, the background translation and the prebuilt variants
+  change what a session costs, and they need their own measurement on the same
+  route.
 
 ## How to measure
 
