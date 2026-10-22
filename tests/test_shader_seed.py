@@ -223,9 +223,13 @@ class ShaderKeyScope(unittest.TestCase):
                 # every shader of this game is prepared for the default bind state, not only the startup one
                 self.assertEqual((manifest['shaders'], manifest['discovered'], manifest['located']), (3, 3, 1))
                 self.assertEqual(manifest['discovered_variants'], 2)
-                # only the startup shader and the listed ones are warmed
+                # every prepared variant is warmed: the warm-up loads its library, so the driver does not compile a
+                # shader the game has never seen in the middle of the first seconds in a new area
                 warm = (output/'pso_manifest.tsv').read_text().splitlines()
-                self.assertEqual([row for row in warm if row.startswith('S\t')], [f'S\t{rows[0][0]}-{seed.SUFFIX}_b\t0'])
+                self.assertEqual(sorted(row for row in warm if row.startswith('S\t')),
+                                 sorted([f'S\t{rows[0][0]}-{seed.SUFFIX}_b\t0',
+                                         f'S\t{rows[1][0]}-{seed.SUFFIX}_b\t1',
+                                         f'S\t{rows[2][0]}-{seed.SUFFIX}_b\t5']))
                 self.assertEqual(manifest['files']['shader-keys.json'], seed.digest((output/'shader-keys.json').read_bytes()))
                 self.assertEqual(seed.prepare(romfs, output, translator, cross, '1.2.1', shared), manifest)
                 self.assertEqual(inventory.call_count, 1)

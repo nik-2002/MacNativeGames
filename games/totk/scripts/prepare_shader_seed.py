@@ -431,8 +431,9 @@ def plan(shaders, startup, listed):
     recorded for Breath of the Wild, 83% are the default one. So every shader is prepared for it, not only the
     startup ones, which are the shaders the title screen and the menus need.
 
-    A 'discovered' variant is not warmed (it gets no row in the warm list): the runtime builds that pipeline when the
-    draw needs it, which costs a fraction of a millisecond, while the library itself comes from the app."""
+    A 'discovered' variant is warmed like every other one: the warm-up loads its library, so the driver does not
+    compile a shader the game has never seen in the middle of the first seconds in a new area. Its pipeline is still
+    built when the draw needs it, which costs a fraction of a millisecond."""
     jobs = [(key, ANSWERS, key+'-'+SUFFIX, 'default' if key in startup else 'discovered') for key in sorted(shaders)]
     for key, deps in sorted(listed):
         if key in shaders:
@@ -535,13 +536,14 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
                         mine[deps] = variant
                         (staging/(key+'.variants')).write_text(json.dumps([dict(variant=v, deps=json.loads(d)) for d, v in
                                                                            mine.items()], separators=(',', ':'))+'\n')
-                        rows = []
-                        if why != 'discovered':   # a discovered variant is not warmed: its pipeline is built when the
-                            # draw needs it, and that costs a fraction of a millisecond
-                            rows = [f'S\t{variant}_b\t'+str({'vs': 0, 'ps': 1, 'cs': 5}[stage])]
-                            if stage == 'cs':
-                                rows.append(f'C\t{variant}_b')
-                            warmed.add(variant)
+                        # Every prepared variant is warmed: the warm-up loads its library, and the driver compiles
+                        # the AIR of a library it has never seen (about 0.1 s) the first time the game draws with it.
+                        # That is what put a freeze into the first seconds in a new area. The pipeline itself is
+                        # not built here (a fraction of a millisecond when the draw needs it).
+                        rows = [f'S\t{variant}_b\t'+str({'vs': 0, 'ps': 1, 'cs': 5}[stage])]
+                        if stage == 'cs':
+                            rows.append(f'C\t{variant}_b')
+                        warmed.add(variant)
                         outcome[index] = ('ok', variant, rows)
                     else:
                         outcome[index] = ('failed', dict(key=key, variant=variant, why=why, stage=stage, source=source,
