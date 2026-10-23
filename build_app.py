@@ -1261,6 +1261,10 @@ def step_app(tree, out, logs, *, version="v0", game='totk'):
                 CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
                 GCSupportsControllerUserInteraction=True)
+    if game == 'botw':
+        # Keep the game's shipped 1600x900 docked render size; the runtime would
+        # otherwise enable the 1080p docked patch by default.
+        info['LSEnvironment'] = {'TOTK_RENDER_RES': '900'}
     icon = tree / 'build/AppIcon.icns'
     if icon.exists():
         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
@@ -1454,11 +1458,22 @@ def step_data_botw(tree, botw, game, keys, logs, *, firmware=None, shared_fonts=
         check('1.6.0 RomFS size', report['romfs_size'], expected['romfs']['size'])
     aoc = tree / f'extracted/{version}/aoc'
     if update:
-        # A separate base/update install has no expansion pass. Drop cached card DLC
-        # and its generated configuration before rebuilding in a reused work folder.
-        if aoc.exists():
-            shutil.rmtree(aoc)
-        (tree / f'build/{version}/aoc_config.h').unlink(missing_ok=True)
+        # A separate base/update install has no expansion pass. Keep a pre-populated,
+        # verified add-on content install (DLC extracted from the card) when present;
+        # otherwise drop cached card DLC.
+        keep_aoc = all((aoc / str(i) / 'index.json').is_file() for i in expected['aoc'])
+        if keep_aoc:
+            for i, want in expected['aoc'].items():
+                report = json.loads((aoc / str(i) / 'index.json').read_text())
+                if report.get('status') != 'pass':
+                    raise BuildError(f'add-on content {i}: extraction record is not a pass')
+                check(f'add-on content {i}', report.get('romfs_sha256'), want['sha256'])
+                if report.get('romfs_size') != want['size']:
+                    raise BuildError(f'add-on content {i}: image size differs')
+        else:
+            if aoc.exists():
+                shutil.rmtree(aoc)
+            (tree / f'build/{version}/aoc_config.h').unlink(missing_ok=True)
     else:
         aoc_valid = True
         for i, want in expected['aoc'].items():

@@ -12,7 +12,21 @@ __pycache__/
 *.sav
 # build output (the work folder normally lives next to the card image)
 TOTK_build/
+SSBU_build/
 *.app/
+# Super Smash Bros. Ultimate local work, extracted game data and NRO/NSO sidecars
+games/ssbu/mods/
+games/ssbu/extracted/
+games/ssbu/rewritten/
+games/ssbu/analysis/
+games/ssbu/build/
+games/ssbu/user-data/
+games/ssbu/romfs.bin
+games/ssbu/data.arc
+games/ssbu/*.nro
+games/ssbu/*.nso
+games/ssbu/*.nca
+games/ssbu/*.kip
 games/totk/.venv
 games/totk/build/
 games/totk/extracted/
