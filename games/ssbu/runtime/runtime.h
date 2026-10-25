@@ -141,7 +141,7 @@ int runtime_gyro_enabled(void);
 void *runtime_hid_feedback_override(const char *name);
 int runtime_hid_feedback_flag(const char *name, int v);   /* "flag rumble|gyro 0|1"; 0 = not one of these names */
 void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads);
-void runtime_rumble_set(unsigned side, float amp_low, float freq_low, float amp_high, float freq_high);   /* side 0 left, 1 right */
+void runtime_rumble_set(unsigned slot, unsigned side, float amp_low, float freq_low, float amp_high, float freq_high);   /* player slot; side 0 left, 1 right */
 int runtime_motion_read(RuntimeMotionState *out, int max);   /* newest first; 0 = no motion now */
 void runtime_motion_start(void);   /* the game (re)started its sensor: angle and direction start over */
 void runtime_motion_feed(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);   /* runtime/motion_fusion.c */
@@ -151,6 +151,6 @@ void runtime_motion_live(int on);   /* a controller with motion attached (1) / d
 void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 #ifdef __OBJC__
 @class GCController;
-void runtime_feedback_attach(GCController *controller);
+void runtime_feedback_attach(GCController *controller, int slot);
 void runtime_feedback_detach(GCController *controller);
 #endif

@@ -21,10 +21,10 @@
 #include "runtime.h"
 
 #if !TARGET_OS_OSX
-void runtime_feedback_attach(GCController *c) { (void)c; }
+void runtime_feedback_attach(GCController *c, int slot) { (void)c; (void)slot; }
 void runtime_feedback_detach(GCController *c) { (void)c; }
 void runtime_feedback_quiet(void) {}
-void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) { (void)side; (void)al; (void)fl; (void)ah; (void)fh; }
+void runtime_rumble_set(unsigned slot, unsigned side, float al, float fl, float ah, float fh) { (void)slot; (void)side; (void)al; (void)fl; (void)ah; (void)fh; }
 #else
 #import <CoreHaptics/CoreHaptics.h>
 
@@ -38,28 +38,31 @@ void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) {
 enum { RUMBLE_TICK_MS = 10, RUMBLE_STALE_MS = 250, RUMBLE_HOLD_MS = 150, RUMBLE_EVENT_S = 30, RUMBLE_RENEW_MS = 25000 };
 static dispatch_queue_t rumbleQueue;
 static dispatch_source_t rumbleTimer;
-static GCController *rumblePad;                     /* rumbleQueue */
-static CHHapticEngine *engines[2];                  /* rumbleQueue */
-static id<CHHapticPatternPlayer> players[2];        /* rumbleQueue */
+/* Every player's controller rumbles on its own: channel = player slot * 2 + side (0 left, 1 right handle). */
+enum { RUMBLE_CH = 2 * RUNTIME_GAMEPAD_SLOTS };
+static GCController *rumblePads[RUNTIME_GAMEPAD_SLOTS];   /* rumbleQueue: the controller of each player slot */
+static CHHapticEngine *engines[RUMBLE_CH];                  /* rumbleQueue */
+static id<CHHapticPatternPlayer> players[RUMBLE_CH];        /* rumbleQueue */
 static CHHapticPattern *pattern;                    /* rumbleQueue: one continuous event, full intensity, middle sharpness */
-static BOOL playing[2];
-static float sentIntensity[2] = {-1, -1}, sentSharpness[2] = {-1, -1};
-static uint64_t quietSince[2], retryAt[2], playedNs[2], playingSince[2], playerSince[2];
+static BOOL playing[RUMBLE_CH];
+static float sentIntensity[RUMBLE_CH], sentSharpness[RUMBLE_CH];
+static uint64_t quietSince[RUMBLE_CH], retryAt[RUMBLE_CH], playedNs[RUMBLE_CH], playingSince[RUMBLE_CH], playerSince[RUMBLE_CH];
 static pthread_mutex_t wantLock = PTHREAD_MUTEX_INITIALIZER;
-static float want[2][4] = {{0, 160, 0, 320}, {0, 160, 0, 320}};
-static uint64_t wantAt[2], wantCount, wantCountLogged;
+static float want[RUMBLE_CH][4];
+static uint64_t wantAt[RUMBLE_CH], wantCount, wantCountLogged;
 static float strongest;
 static float gain = 1.0f;
 
-void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) {
-    if (side > 1) return;
+void runtime_rumble_set(unsigned slot, unsigned hand, float al, float fl, float ah, float fh) {
+    if (slot >= RUNTIME_GAMEPAD_SLOTS || hand > 1) return;
+    unsigned side = slot * 2 + hand;
     pthread_mutex_lock(&wantLock);
     want[side][0] = al; want[side][1] = fl; want[side][2] = ah; want[side][3] = fh; wantAt[side] = runtime_now_ns(); wantCount++;
     float a = al > ah ? al : ah; if (a > strongest) strongest = a;
     pthread_mutex_unlock(&wantLock);
 }
 void runtime_feedback_quiet(void) {
-    pthread_mutex_lock(&wantLock); wantAt[0] = wantAt[1] = 0; pthread_mutex_unlock(&wantLock);
+    pthread_mutex_lock(&wantLock); memset(wantAt, 0, sizeof wantAt); pthread_mutex_unlock(&wantLock);
 }
 static float intensity_of(const float v[4]) {
     float a = sqrtf(v[0] * v[0] + v[2] * v[2]) * gain;
@@ -74,13 +77,14 @@ static void forget_side(int side) {   /* rumbleQueue: the engine stopped or was 
     players[side] = nil; engines[side] = nil; playing[side] = NO; sentIntensity[side] = sentSharpness[side] = -1;
 }
 static void rumble_failed(int side, const char *what, NSError *err) {
-    fprintf(stderr, "[rumble] %s handle: %s failed: %s (trying again in 5 s)\n", side ? "right" : "left", what,
+    fprintf(stderr, "[rumble] player %d %s handle: %s failed: %s (trying again in 5 s)\n", side / 2 + 1, side & 1 ? "right" : "left", what,
             err ? err.localizedDescription.UTF8String : "no reason given");
     forget_side(side); retryAt[side] = runtime_now_ns() + 5000000000ull;
 }
 static BOOL ensure_engine(int side) {   /* rumbleQueue */
     if (engines[side]) return YES;
-    if (!rumblePad.haptics || runtime_now_ns() < retryAt[side]) return NO;
+    GCController *pad = rumblePads[side / 2];
+    if (!pad.haptics || runtime_now_ns() < retryAt[side]) return NO;
     NSError *err = nil;
     if (!pattern) {
         CHHapticEventParameter *intensity = [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1.0f];
@@ -90,9 +94,9 @@ static BOOL ensure_engine(int side) {   /* rumbleQueue */
         pattern = [[CHHapticPattern alloc] initWithEvents:@[event] parameters:@[] error:&err];
         if (!pattern) { rumble_failed(side, "building the pattern", err); return NO; }
     }
-    GCHapticsLocality where = side ? GCHapticsLocalityRightHandle : GCHapticsLocalityLeftHandle;
-    if (![rumblePad.haptics.supportedLocalities containsObject:where]) where = GCHapticsLocalityDefault;   /* a pad with one motor */
-    CHHapticEngine *e = [rumblePad.haptics createEngineWithLocality:where];
+    GCHapticsLocality where = side & 1 ? GCHapticsLocalityRightHandle : GCHapticsLocalityLeftHandle;
+    if (![pad.haptics.supportedLocalities containsObject:where]) where = GCHapticsLocalityDefault;   /* a pad with one motor */
+    CHHapticEngine *e = [pad.haptics createEngineWithLocality:where];
     if (!e) { rumble_failed(side, "creating the haptic engine", nil); return NO; }
     e.resetHandler = ^{ dispatch_async(rumbleQueue, ^{ forget_side(side); }); };
     e.stoppedHandler = ^(CHHapticEngineStoppedReason reason) { (void)reason; dispatch_async(rumbleQueue, ^{ forget_side(side); }); };
@@ -122,7 +126,7 @@ static BOOL start_player(int side, float intensity, float sharpness, uint64_t no
 }
 static void rumble_tick(void) {   /* rumbleQueue, every 10 ms */
     uint64_t now = runtime_now_ns();
-    for (int side = 0; side < 2; side++) {
+    for (int side = 0; side < RUMBLE_CH; side++) {
         float v[4]; uint64_t at;
         pthread_mutex_lock(&wantLock); memcpy(v, want[side], sizeof v); at = wantAt[side]; pthread_mutex_unlock(&wantLock);
         float intensity = at && now - at < RUMBLE_STALE_MS * 1000000ull ? intensity_of(v) : 0, sharpness = sharpness_of(v);
@@ -144,10 +148,17 @@ static void rumble_tick(void) {   /* rumbleQueue, every 10 ms */
     static uint64_t lastLog; if (!lastLog) lastLog = now;
     if (now - lastLog >= 30000000000ull) {
         pthread_mutex_lock(&wantLock); uint64_t n = wantCount - wantCountLogged; float peak = strongest; wantCountLogged = wantCount; strongest = 0; pthread_mutex_unlock(&wantLock);
-        for (int side = 0; side < 2; side++) if (playing[side]) { playedNs[side] += now - playingSince[side]; playingSince[side] = now; }
-        if (n) fprintf(stderr, "[rumble] last 30 s: %llu values from the game, strongest amplitude %.2f, played left %.1f s / right %.1f s%s\n",
-                       (unsigned long long)n, peak, playedNs[0] / 1e9, playedNs[1] / 1e9, rumblePad.haptics ? "" : " (no controller with haptics)");
-        playedNs[0] = playedNs[1] = 0; lastLog = now;
+        for (int side = 0; side < RUMBLE_CH; side++) if (playing[side]) { playedNs[side] += now - playingSince[side]; playingSince[side] = now; }
+        if (n) {
+            char per[256]; size_t o = 0; per[0] = 0;
+            for (int slot = 0; slot < RUNTIME_GAMEPAD_SLOTS && o < sizeof per - 48; slot++)
+                if (rumblePads[slot] || playedNs[slot * 2] || playedNs[slot * 2 + 1])
+                    o += (size_t)snprintf(per + o, sizeof per - o, ", player %d %.1f s / %.1f s%s", slot + 1, playedNs[slot * 2] / 1e9,
+                                          playedNs[slot * 2 + 1] / 1e9, rumblePads[slot].haptics ? "" : " (no haptics)");
+            fprintf(stderr, "[rumble] last 30 s: %llu values from the game, strongest amplitude %.2f, played left / right%s\n",
+                    (unsigned long long)n, peak, o ? per : ": no controller");
+        }
+        memset(playedNs, 0, sizeof playedNs); lastLog = now;
     }
 }
 static void rumble_start(void) {
@@ -280,17 +291,18 @@ static void hid_motion_stop(void) {   /* main queue */
 }
 
 /* ---- controllers ---- */
-void runtime_feedback_attach(GCController *c) {   /* main queue */
+void runtime_feedback_attach(GCController *c, int slot) {   /* main queue; slot: the player it is */
     const char *name = (c.vendorName ?: @"controller").UTF8String;
     if (runtime_rumble_enabled()) {
         rumble_start();
         if (c.haptics) {
-            dispatch_async(rumbleQueue, ^{ for (int s = 0; s < 2; s++) { if (players[s]) [players[s] stopAtTime:CHHapticTimeImmediate error:nil]; forget_side(s); retryAt[s] = 0; } rumblePad = c; });
+            dispatch_async(rumbleQueue, ^{ for (int s = slot * 2; s < slot * 2 + 2; s++) { if (players[s]) [players[s] stopAtTime:CHHapticTimeImmediate error:nil]; forget_side(s); retryAt[s] = 0; } rumblePads[slot] = c; });
             NSMutableArray *where = [NSMutableArray array]; for (NSString *l in c.haptics.supportedLocalities) [where addObject:l];
-            fprintf(stderr, "[rumble] %s: haptics (%s)\n", name, [where componentsJoinedByString:@", "].UTF8String);
+            fprintf(stderr, "[rumble] %s: haptics for player %d (%s)\n", name, slot + 1, [where componentsJoinedByString:@", "].UTF8String);
         } else fprintf(stderr, "[rumble] %s has no haptics: no rumble from it\n", name);
     }
-    if (runtime_gyro_enabled()) {
+    /* The game has one six-axis sensor stream here: player 1's controller. */
+    if (runtime_gyro_enabled() && slot == 0) {
         static dispatch_once_t once;
         dispatch_once(&once, ^{
             const char *axes = getenv("TOTK_GYRO_AXES"); int r = runtime_motion_axes(axes);
@@ -308,7 +320,12 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
 }
 void runtime_feedback_detach(GCController *c) {   /* main queue */
     if (runtime_rumble_enabled() && rumbleQueue)
-        dispatch_async(rumbleQueue, ^{ if (rumblePad == c) { for (int s = 0; s < 2; s++) forget_side(s); rumblePad = nil; } });
+        dispatch_async(rumbleQueue, ^{
+            for (int slot = 0; slot < RUNTIME_GAMEPAD_SLOTS; slot++) if (rumblePads[slot] == c) {
+                for (int s = slot * 2; s < slot * 2 + 2; s++) { if (players[s]) [players[s] stopAtTime:CHHapticTimeImmediate error:nil]; forget_side(s); }
+                rumblePads[slot] = nil;
+            }
+        });
     if (motionPad == c) {
         c.motion.valueChangedHandler = nil; hid_motion_stop(); motionPad = nil; runtime_motion_live(0);
     }

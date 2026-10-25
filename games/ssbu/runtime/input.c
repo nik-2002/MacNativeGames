@@ -133,7 +133,10 @@ static void joy_assign_nop2(const uint32_t *id,int type){(void)id;(void)type;}
 static uint32_t merge_single_joy(const uint32_t *a,const uint32_t *b){(void)a;(void)b;return 0;}
 static void swap_npad(const uint32_t *a,const uint32_t *b){(void)a;(void)b;}
 static void lr_mode_nop(void){}
-static uint8_t led_pattern(const uint32_t *id){static const uint8_t pat[8]={1,2,4,8,3,5,9,6};return id&&*id<8?pat[*id]:1;}
+/* The Switch's player lights (hid GetPlayerLedPattern): players 1-4 light 1, 2, 3, 4 lamps from the left; 5-8 the
+   patterns 1+4, 1+3, 1+3+4, 2+3. Bit 0 is the leftmost lamp. */
+static uint8_t led_pattern(const uint32_t *id){static const uint8_t pat[8]={0x1,0x3,0x7,0xf,0x9,0x5,0xd,0x6};uint8_t v=id&&*id<8?pat[*id]:0x1;
+ static uint32_t logged;if(id&&*id<8&&!(logged>>*id&1)){logged|=1u<<*id;fprintf(stderr,"[ssbu-input] game asks the player light of controller %#x: %#x\n",*id,v);}return v;}
 static uint32_t ctrl_color1(uint32_t *c,const uint32_t *id){(void)id;if(c){c[0]=0xff828282u;c[1]=0xff0f0f0fu;}return 0;}
 static uint32_t ctrl_color2(uint32_t *l,uint32_t *r,const uint32_t *id){(void)id;if(l){l[0]=0xff828282u;l[1]=0xff0f0f0fu;}if(r){r[0]=0xff828282u;r[1]=0xff0f0f0fu;}return 0;}
 static uint32_t seven_init(void *buf,size_t n){(void)buf;(void)n;return 0;}

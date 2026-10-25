@@ -166,7 +166,7 @@ static void attach_gamepad(GCController *controller) {
     fprintf(stderr, "[ssbu-input] native gamepad connected as player %d: %s (%s), face buttons by %s\n", slot + 1,
             (controller.vendorName ?: @"unknown").UTF8String,
             (controller.productCategory ?: @"unknown").UTF8String, face_by_position(controller) ? "position" : "label");
-    runtime_feedback_attach(controller);
+    runtime_feedback_attach(controller, slot);
     refresh_slot(slot);
 }
 
