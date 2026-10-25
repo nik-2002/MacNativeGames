@@ -103,6 +103,7 @@ manual:
 	rm -rf "$(WORK)/manual-image" "$(WORK)/manual"
 	"$(PY)" scripts/merge_romfs.py "$(BASE)" "$(UPDATE)" --keys "$(KEYS)" --content html-document --output "$(WORK)/manual-image"
 	"$(PY)" scripts/unpack_romfs.py "$(WORK)/manual-image" --output "$(WORK)/manual"
+	"$(PY)" scripts/decode_shared_fonts.py "$(WORK)/extracted/firmware/shared-fonts" --output "$(WORK)/manual/html-document/system-fonts"
 	rm -rf "$(WORK)/manual-image"
 
 # The app: a small launcher bundle (settings window with presets, then the game) that runs the game from the work

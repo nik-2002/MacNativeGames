@@ -435,7 +435,8 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
    applet takes the screen; here a web view covers the game window and the calling guest thread waits until the player
    closes it. The pages come from <work>/manual/html-document (make manual: the HtmlDocument NCA of the player's base game
    and update). Their scripts call the applet's "nx" object (endApplet, footer, playReport): a stand-in answers every call,
-   endApplet closes the page. Controls: mouse; B / Escape go back, or close on the first page; D-pad / left stick scroll. */
+   endApplet closes the page. Controls: mouse; B / Escape go back, or close on the first page; D-pad / left stick scroll.
+   No buttons of our own: the pages draw the applet's button guide themselves ("B Back"). */
 @interface TOTKPageView:NSView<WKScriptMessageHandler,WKNavigationDelegate>
 @property(strong) WKWebView *web;
 @property(strong) NSTimer *pad;
@@ -487,11 +488,18 @@ int runtime_front_offline_page(const char *document_path){
    "var nx=stub();nx.endApplet=function(){window.webkit.messageHandlers.nx.postMessage('end');};window.nx=nx;"
    "if(!window.endApplet)window.endApplet=function(){nx.endApplet();};})();";
   [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:shim injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
+  /* The applet's own fonts: the pages' button guide ("B Back") names keyhelpFont / KeyHelpFont without a file, the Switch's
+     standard UI font with the Nintendo extension font for the button glyphs (make manual decodes both into system-fonts). */
+  NSString *fonts=[[NSURL fileURLWithPath:[NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:@"manual/html-document/system-fonts"] isDirectory:YES] absoluteString];
+  NSMutableString *css=[NSMutableString string];
+  [css appendFormat:@"@font-face{font-family:keyhelpFont;src:url('%@nintendo-extension.ttf');unicode-range:U+E000-E1FF}"   /* family names ignore case */
+   "@font-face{font-family:keyhelpFont;src:url('%@standard.ttf');unicode-range:U+0000-DFFF,U+F000-FFFF}",fonts,fonts];
+  NSString *fontScript=[NSString stringWithFormat:@"(function(){var s=document.createElement('style');s.textContent=%@;document.documentElement.appendChild(s);})();",
+   [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:css options:NSJSONWritingFragmentsAllowed error:nil] encoding:NSUTF8StringEncoding]];
+  [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:fontScript injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
   [cfg.userContentController addScriptMessageHandler:page name:@"nx"];
   WKWebView *web=[[WKWebView alloc] initWithFrame:page.bounds configuration:cfg];web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;web.navigationDelegate=page;
   page.web=web;[page addSubview:web];page.wantsLayer=YES;page.layer.backgroundColor=NSColor.blackColor.CGColor;
-  NSButton *close=[NSButton buttonWithTitle:@(TOTK_UI("关闭 (Esc / B)","Close (Esc / B)")) target:page action:@selector(finish)];
-  close.frame=NSMakeRect(cv.bounds.size.width-170,cv.bounds.size.height-44,156,30);close.autoresizingMask=NSViewMinXMargin|NSViewMinYMargin;[page addSubview:close];
   __weak TOTKPageView *weakPage=page;
   page.done=^{TOTKPageView *p=weakPage;[p.web.configuration.userContentController removeScriptMessageHandlerForName:@"nx"];[p removeFromSuperview];
    [window makeFirstResponder:window.contentView];runtime_input_clear();dispatch_semaphore_signal(sem);};
