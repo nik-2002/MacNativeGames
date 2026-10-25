@@ -42,6 +42,10 @@ void runtime_hle_describe(unsigned index, char *out, size_t cap);   /* hle_stack
    as UTF-8 in out), Escape cancels (0). The caller waits; give the virtual core up around it (runtime_core_away). */
 typedef struct { const char *prompt, *initial; int max_units, min_units, secure, digits_only; uint32_t disabled; } RuntimeTextRequest;
 int runtime_front_text_input(const RuntimeTextRequest *req, char *out, size_t out_size);
+/* The game's offline manual page (nn::web::ShowOfflineHtmlPage) over the game window, from <work>/manual (make manual);
+   returns when the player closes it: 1 shown, 0 not available. */
+int runtime_front_offline_page(const char *document_path);
+void runtime_front_offline_test(const char *op);   /* diagnostics: "shot <path>", "close" the open page */
 void runtime_front_text_test(const char *op, const char *text);   /* diagnostics: "type" text, "enter", "esc" into the open bar */
 int runtime_core_away(void);          /* runtime/threads.c: a guest thread gives its virtual core up around a long host wait */
 void runtime_core_back(int *away);

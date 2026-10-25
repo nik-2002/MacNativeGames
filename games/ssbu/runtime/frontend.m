@@ -3,6 +3,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <CoreVideo/CoreVideo.h>
+#import <WebKit/WebKit.h>
 #include <stdatomic.h>
 #include <math.h>
 #include "runtime.h"
@@ -254,12 +255,68 @@ void runtime_front_run(void(*callback)(void)){
    prompt and one text field (input methods work); Return confirms, Escape cancels. Characters the game disallows and text
    beyond its length limit are removed as they are typed (the caller checks again). The calling guest thread waits on a
    semaphore; the game's keys are cleared while the bar has the keyboard. */
+/* On-screen keyboard under the text field, for players on a controller (user, 2026-10-25): four rows of ten keys and a row of
+   actions. Any controller drives it -- D-pad / left stick move (held: repeats), A types the key, B deletes, Y space,
+   L capitals, R symbols, + done, - cancel -- and the mouse clicks keys. The first letter is a capital, as the Switch does. */
+static NSString *const KEY_SHIFT=@"\u21E7",*const KEY_SYMBOLS=@"#+=",*const KEY_SPACE=@" ",*const KEY_DELETE=@"\u232B",*const KEY_DONE=@"OK";
+@interface TOTKKeyGrid:NSView
+@property int row,col;
+@property BOOL shift,symbols,autoShift;   /* autoShift: the shift is the first-letter capital, not the player's */
+@property(copy) void(^press)(NSString *key);
+-(void)move:(int)dx :(int)dy;
+-(NSString *)keyAt:(int)r :(int)c;
+@end
+@implementation TOTKKeyGrid
+static const double actionUnits[5]={1.5,1.5,4,1.5,1.5};
+-(BOOL)isFlipped{return YES;}
+-(int)columns:(int)r{return r<4?10:5;}
+-(NSString *)keyAt:(int)r :(int)c{
+ static NSString *const letters[4]={@"1234567890",@"qwertyuiop",@"asdfghjkl'",@"zxcvbnm,.-"};
+ static NSString *const symbols[4]={@"!@#$%^&*()",@"-_=+[]{};:",@"\"/?<>|\\~`",@"\u00E9\u00E8\u00F1\u00FC\u00E7\u00E0\u00F6\u00DF\u2665\u2606"};
+ if(r==4)return @[self.symbols?@"abc":KEY_SYMBOLS,KEY_SHIFT,KEY_SPACE,KEY_DELETE,KEY_DONE][c];
+ NSString *k=[(self.symbols?symbols:letters)[r] substringWithRange:NSMakeRange((NSUInteger)c,1)];
+ return self.shift?k.uppercaseString:k;
+}
+-(NSRect)rectAt:(int)r :(int)c{
+ CGFloat gap=6,w=self.bounds.size.width,h=(self.bounds.size.height-4*gap)/5,unit=(w-9*gap)/10,x=0;
+ if(r<4)return NSMakeRect(c*(unit+gap),r*(h+gap),unit,h);
+ for(int i=0;i<c;i++)x+=actionUnits[i]*unit+(actionUnits[i]-1)*gap+gap;
+ return NSMakeRect(x,4*(h+gap),actionUnits[c]*unit+(actionUnits[c]-1)*gap,h);
+}
+-(void)drawRect:(NSRect)dirty{(void)dirty;
+ for(int r=0;r<5;r++)for(int c=0;c<[self columns:r];c++){
+  NSRect k=[self rectAt:r :c];BOOL sel=r==self.row&&c==self.col,on=r==4&&((c==1&&self.shift)||(c==0&&self.symbols));
+  [(sel?[NSColor colorWithCalibratedRed:0.15 green:0.55 blue:0.95 alpha:1]:on?[NSColor colorWithCalibratedWhite:0.38 alpha:1]:[NSColor colorWithCalibratedWhite:0.2 alpha:1]) setFill];
+  [[NSBezierPath bezierPathWithRoundedRect:k xRadius:7 yRadius:7] fill];
+  NSString *t=[self keyAt:r :c];if([t isEqualToString:KEY_SPACE])t=@(TOTK_UI("空格","space"));
+  NSDictionary *a=@{NSFontAttributeName:[NSFont systemFontOfSize:r==4?15:19 weight:NSFontWeightMedium],NSForegroundColorAttributeName:NSColor.whiteColor};
+  NSSize z=[t sizeWithAttributes:a];[t drawAtPoint:NSMakePoint(NSMidX(k)-z.width/2,NSMidY(k)-z.height/2) withAttributes:a];}
+}
+-(void)move:(int)dx :(int)dy{
+ int r=self.row,c=self.col;
+ if(dy){int nr=(r+dy+5)%5;
+  if(r<4&&nr==4){double x=c+0.5,acc=0;c=4;for(int i=0;i<5;i++){acc+=actionUnits[i];if(x<=acc){c=i;break;}}}
+  else if(r==4&&nr<4){double acc=0;for(int i=0;i<c;i++)acc+=actionUnits[i];c=(int)fmin(9,acc+actionUnits[c]/2);}
+  r=nr;}
+ if(dx)c=(c+dx+[self columns:r])%[self columns:r];
+ self.row=r;self.col=c;self.needsDisplay=YES;
+}
+-(void)mouseDown:(NSEvent *)e{
+ NSPoint p=[self convertPoint:e.locationInWindow fromView:nil];
+ for(int r=0;r<5;r++)for(int c=0;c<[self columns:r];c++)if(NSPointInRect(p,[self rectAt:r :c])){self.row=r;self.col=c;self.needsDisplay=YES;if(self.press)self.press([self keyAt:r :c]);return;}
+}
+@end
 @interface TOTKTextBar:NSView<NSTextFieldDelegate>
 @property(strong) NSTextField *field;
 @property int maxUnits,minUnits,digitsOnly;
 @property uint32_t disabled;
 @property(copy) void(^done)(NSString *text);   /* nil: cancelled */
+@property(strong) TOTKKeyGrid *grid;
+@property(strong) NSTimer *pad;
+@property uint64_t prev,repeatAt;
+@property int repeatDir;
 -(void)refilter;
+-(void)key:(NSString *)k;
 @end
 @implementation TOTKTextBar
 -(BOOL)allowed:(unichar)c{
@@ -269,7 +326,9 @@ void runtime_front_run(void(*callback)(void)){
  if((d&1u<<1&&c==' ')||(d&1u<<2&&c=='@')||(d&1u<<3&&c=='%')||(d&1u<<4&&c=='/')||(d&1u<<5&&c=='\\')||(d&1u<<6&&digit))return NO;
  return YES;
 }
--(void)controlTextDidChange:(NSNotification *)n{(void)n;[self refilter];}
+-(void)controlTextDidChange:(NSNotification *)n{(void)n;[self refilter];
+ TOTKKeyGrid *g=self.grid;BOOL empty=!self.field.stringValue.length;   /* typed on the Mac keyboard: the first-letter capital follows */
+ if(!g.symbols&&g.shift!=empty&&g.autoShift){g.shift=empty;g.needsDisplay=YES;}}
 -(void)refilter{
  NSText *ed=self.field.currentEditor;if([ed isKindOfClass:NSTextView.class]&&((NSTextView *)ed).hasMarkedText)return;   /* still composing */
  NSString *s=self.field.stringValue;NSMutableString *t=[NSMutableString string];
@@ -280,11 +339,41 @@ void runtime_front_run(void(*callback)(void)){
   [t appendString:sub];}];
  if(![t isEqualToString:s]){self.field.stringValue=t;NSBeep();}
 }
--(void)finish:(NSString *)text{void(^d)(NSString *)=self.done;self.done=nil;if(d)d(text);}
+-(void)finish:(NSString *)text{[self.pad invalidate];self.pad=nil;void(^d)(NSString *)=self.done;self.done=nil;if(d)d(text);}
+-(void)confirm{[self refilter];NSString *s=self.field.stringValue;
+ if((NSInteger)s.length<self.minUnits||!s.length){NSBeep();return;}[self finish:s];}
+-(void)key:(NSString *)k{   /* a key of the on-screen keyboard */
+ TOTKKeyGrid *g=self.grid;NSString *s=self.field.stringValue;
+ if([k isEqualToString:KEY_DONE]){[self confirm];return;}
+ if([k isEqualToString:KEY_SHIFT]){g.shift=!g.shift;g.autoShift=NO;g.needsDisplay=YES;return;}
+ if([k isEqualToString:KEY_SYMBOLS]||[k isEqualToString:@"abc"]){g.symbols=!g.symbols;g.needsDisplay=YES;return;}
+ if([k isEqualToString:KEY_DELETE]){if(s.length){NSRange r=[s rangeOfComposedCharacterSequenceAtIndex:s.length-1];self.field.stringValue=[s substringToIndex:r.location];}
+  if(!self.field.stringValue.length&&!g.symbols){g.shift=g.autoShift=YES;g.needsDisplay=YES;}return;}
+ self.field.stringValue=[s stringByAppendingString:k];[self refilter];
+ if(g.shift&&!g.symbols&&k.length==1&&[NSCharacterSet.letterCharacterSet characterIsMember:[k characterAtIndex:0]]&&g.autoShift){g.shift=NO;g.needsDisplay=YES;}
+ NSText *ed=self.field.currentEditor;if(ed)ed.selectedRange=NSMakeRange(self.field.stringValue.length,0);
+}
+-(void)poll{   /* every controller (the game is waiting for the text, so its reads are not disturbed) */
+ uint64_t b=0;int32_t lx=0,ly=0;
+ for(int s=0;s<RUNTIME_GAMEPAD_SLOTS;s++){RuntimeGamepadState g;runtime_gamepad_read_slot(s,&g);b|=g.buttons;if(abs(g.lx)>abs(lx))lx=g.lx;if(abs(g.ly)>abs(ly))ly=g.ly;}
+ uint64_t press=b&~self.prev,now=runtime_now_ns();self.prev=b;
+ TOTKKeyGrid *g=self.grid;
+ if(press&1)[self key:[g keyAt:g.row :g.col]];
+ if(press&2)[self key:KEY_DELETE];
+ if(press&8)[self key:KEY_SPACE];
+ if(press&64)[self key:KEY_SHIFT];
+ if(press&128)[self key:KEY_SYMBOLS];
+ if(press&1024){[self confirm];return;}
+ if(press&2048){[self finish:nil];return;}
+ int dir=(b&1u<<12)||lx<-16000?1:(b&1u<<14)||lx>16000?2:(b&1u<<13)||ly>16000?3:(b&1u<<15)||ly<-16000?4:0;
+ if(dir!=self.repeatDir){self.repeatDir=dir;self.repeatAt=now+380000000ull;}
+ else if(!dir||now<self.repeatAt)return;
+ else self.repeatAt=now+90000000ull;
+ if(dir)[g move:dir==1?-1:dir==2?1:0 :dir==3?-1:dir==4?1:0];
+}
 -(BOOL)control:(NSControl *)c textView:(NSTextView *)tv doCommandBySelector:(SEL)sel{
  (void)c;(void)tv;
- if(sel==@selector(insertNewline:)){[self refilter];NSString *s=self.field.stringValue;
-  if((NSInteger)s.length<self.minUnits||!s.length){NSBeep();return YES;}[self finish:s];return YES;}
+ if(sel==@selector(insertNewline:)){[self confirm];return YES;}
  if(sel==@selector(cancelOperation:)){[self finish:nil];return YES;}
  return NO;
 }
@@ -310,7 +399,7 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
  int maxU=req->max_units,minU=req->min_units,digits=req->digits_only,secure=req->secure;uint32_t dis=req->disabled;
  __block NSString *result=nil;dispatch_semaphore_t sem=dispatch_semaphore_create(0);
  dispatch_async(dispatch_get_main_queue(), ^{
-  NSView *cv=window.contentView;CGFloat w=fmin(720,cv.bounds.size.width-40),h=104;
+  NSView *cv=window.contentView;CGFloat w=fmin(720,cv.bounds.size.width-40),G=fmin(240,cv.bounds.size.height-220),h=G+122;
   TOTKTextBar *bar=[[TOTKTextBar alloc] initWithFrame:NSMakeRect(floor((cv.bounds.size.width-w)/2),48,w,h)];
   bar.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMaxYMargin;bar.wantsLayer=YES;bar.layer.cornerRadius=12;
   bar.layer.backgroundColor=[NSColor colorWithCalibratedRed:0.035 green:0.075 blue:0.09 alpha:0.92].CGColor;
@@ -318,14 +407,19 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
   NSTextField *label=[NSTextField labelWithString:prompt];label.font=[NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
   label.textColor=NSColor.whiteColor;label.frame=NSMakeRect(18,h-36,w-36,22);label.lineBreakMode=NSLineBreakByTruncatingTail;
   NSString *limit=maxU>0?[NSString stringWithFormat:@(TOTK_UI("最多 %d 个字 · ","Up to %d characters · ")),maxU]:@"";
-  NSTextField *hint=[NSTextField labelWithString:[NSString stringWithFormat:@(TOTK_UI("%@用键盘输入，回车确定，Esc 取消","%@Type with the keyboard, Return to confirm, Esc to cancel")),limit]];
-  hint.font=[NSFont systemFontOfSize:12];hint.textColor=[NSColor colorWithCalibratedWhite:0.72 alpha:1];hint.alignment=NSTextAlignmentRight;
-  hint.frame=NSMakeRect(18,h-36,w-36,20);hint.autoresizingMask=NSViewWidthSizable;
-  NSTextField *field=secure?[[NSSecureTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)]:[[NSTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)];
+  NSTextField *hint=[NSTextField labelWithString:[NSString stringWithFormat:@(TOTK_UI("%@键盘：回车确定，Esc 取消 · 手柄：A 输入 B 删除 Y 空格 L 大写 R 符号 + 确定 − 取消","%@Keyboard: Return / Esc · Controller: A type, B delete, Y space, L caps, R symbols, + done, \u2212 cancel")),limit]];
+  hint.font=[NSFont systemFontOfSize:12];hint.textColor=[NSColor colorWithCalibratedWhite:0.72 alpha:1];hint.alignment=NSTextAlignmentLeft;hint.lineBreakMode=NSLineBreakByTruncatingTail;
+  hint.frame=NSMakeRect(18,G+62,w-36,18);hint.autoresizingMask=NSViewWidthSizable;
+  NSTextField *field=secure?[[NSSecureTextField alloc] initWithFrame:NSMakeRect(18,G+24,w-36,34)]:[[NSTextField alloc] initWithFrame:NSMakeRect(18,G+24,w-36,34)];
   field.font=[NSFont systemFontOfSize:20];field.stringValue=initial;field.delegate=bar;field.bezelStyle=NSTextFieldRoundedBezel;bar.field=field;
   __weak TOTKTextBar *weakBar=bar;
   bar.done=^(NSString *text){result=[text copy];[weakBar removeFromSuperview];[window makeFirstResponder:window.contentView];dispatch_semaphore_signal(sem);};
-  [bar addSubview:label];[bar addSubview:hint];[bar addSubview:field];[cv addSubview:bar];openBar=bar;
+  TOTKKeyGrid *grid=[[TOTKKeyGrid alloc] initWithFrame:NSMakeRect(18,12,w-36,G)];grid.shift=grid.autoShift=!initial.length&&!digits;grid.row=1;
+  grid.press=^(NSString *k){[weakBar key:k];};bar.grid=grid;
+  [bar addSubview:label];[bar addSubview:hint];[bar addSubview:field];[bar addSubview:grid];[cv addSubview:bar];openBar=bar;
+  bar.prev=~0ull;   /* buttons held when the bar opens (the A that opened it) do not count */
+  bar.pad=[NSTimer timerWithTimeInterval:1.0/60 target:bar selector:@selector(poll) userInfo:nil repeats:YES];
+  [NSRunLoop.mainRunLoop addTimer:bar.pad forMode:NSRunLoopCommonModes];
   runtime_input_clear();
   if(window.miniaturized)[window deminiaturize:nil];
   if(!assume_focus()){[NSApp activateIgnoringOtherApps:YES];[window makeKeyAndOrderFront:nil];}   /* test windows never take the keyboard */
@@ -336,6 +430,98 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
  if(!result)return 0;
  snprintf(out,out_size,"%s",result.UTF8String?result.UTF8String:"");
  return 1;
+}
+/* The game's offline manual (Y Help: nn::web::ShowOfflineHtmlPage, runtime/system_services.c). On the Switch the web
+   applet takes the screen; here a web view covers the game window and the calling guest thread waits until the player
+   closes it. The pages come from <work>/manual/html-document (make manual: the HtmlDocument NCA of the player's base game
+   and update). Their scripts call the applet's "nx" object (endApplet, footer, playReport): a stand-in answers every call,
+   endApplet closes the page. Controls: mouse; B / Escape go back, or close on the first page; D-pad / left stick scroll. */
+@interface TOTKPageView:NSView<WKScriptMessageHandler,WKNavigationDelegate>
+@property(strong) WKWebView *web;
+@property(strong) NSTimer *pad;
+@property uint64_t prev;
+@property(copy) void(^done)(void);
+@end
+@implementation TOTKPageView
+-(void)userContentController:(WKUserContentController *)c didReceiveScriptMessage:(WKScriptMessage *)m{(void)c;(void)m;[self finish];}
+-(void)finish{[self.pad invalidate];self.pad=nil;void(^d)(void)=self.done;self.done=nil;if(d)d();}
+-(void)back{if(self.web.canGoBack)[self.web goBack];else [self finish];}
+-(BOOL)acceptsFirstResponder{return YES;}
+-(void)layout{[super layout];   /* the pages are laid out for the Switch's 1280x720 screen: scale them to the window */
+ NSSize z=self.bounds.size;self.web.pageZoom=fmax(0.25,fmin(z.width/1280,z.height/720));}
+-(void)cancelOperation:(id)sender{(void)sender;[self back];}
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==53)[self back];else [super keyDown:e];}
+-(void)webView:(WKWebView *)w didFinishNavigation:(WKNavigation *)n{(void)n;[w.window makeFirstResponder:w];}
+-(void)poll{   /* every controller: B back, D-pad / left stick scroll (the game is waiting, so its reads are not disturbed) */
+ uint64_t b=0;int32_t ly=0;
+ for(int s=0;s<RUNTIME_GAMEPAD_SLOTS;s++){RuntimeGamepadState g;runtime_gamepad_read_slot(s,&g);b|=g.buttons;if(abs(g.ly)>abs(ly))ly=g.ly;}
+ uint64_t press=b&~self.prev;self.prev=b;
+ if(press&2){[self back];return;}
+ int dy=(b&1u<<13)?-1:(b&1u<<15)?1:ly>12000?-1:ly<-12000?1:0;
+ if(dy)[self.web evaluateJavaScript:[NSString stringWithFormat:@"window.scrollBy(0,%d)",dy*24] completionHandler:nil];
+}
+@end
+static __weak TOTKPageView *openPage;   /* main thread only */
+static NSString *manual_file(NSString *path){   /* "contents/help/x.html" -> <work>/manual/html-document/contents.htdocs/help/x.html */
+ NSString *root=[NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:@"manual/html-document"];
+ NSArray<NSString *> *parts=path.pathComponents;if(!parts.count)return nil;
+ for(NSString *first in @[[parts[0] stringByAppendingString:@".htdocs"],parts[0]]){
+  NSString *f=[[root stringByAppendingPathComponent:first] stringByAppendingPathComponent:[NSString pathWithComponents:[parts subarrayWithRange:NSMakeRange(1,parts.count-1)]]];
+  if([NSFileManager.defaultManager fileExistsAtPath:f])return f;}
+ return nil;
+}
+int runtime_front_offline_page(const char *document_path){
+ NSString *full=[NSString stringWithUTF8String:document_path?document_path:""]?:@"";
+ NSRange q=[full rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"?#"]];
+ NSString *path=q.location==NSNotFound?full:[full substringToIndex:q.location],*query=q.location==NSNotFound?@"":[full substringFromIndex:q.location];
+ while([path hasPrefix:@"/"])path=[path substringFromIndex:1];
+ NSString *file=manual_file(path);
+ if(!window||!file){fprintf(stderr,"[ssbu] offline page: %s not available (%s)\n",full.UTF8String,window?"no manual: make manual":"no window");return 0;}
+ dispatch_semaphore_t sem=dispatch_semaphore_create(0);
+ dispatch_async(dispatch_get_main_queue(), ^{
+  NSView *cv=window.contentView;
+  TOTKPageView *page=[[TOTKPageView alloc] initWithFrame:cv.bounds];page.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
+  WKWebViewConfiguration *cfg=[WKWebViewConfiguration new];
+  [cfg.preferences setValue:@YES forKey:@"allowFileAccessFromFileURLs"];
+  NSString *shim=@"(function(){function stub(){return new Proxy(function(){},{get:function(t,k){if(k==='then')return undefined;if(!(k in t))t[k]=stub();return t[k];},apply:function(){return undefined;}});}"
+   "var nx=stub();nx.endApplet=function(){window.webkit.messageHandlers.nx.postMessage('end');};window.nx=nx;"
+   "if(!window.endApplet)window.endApplet=function(){nx.endApplet();};})();";
+  [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:shim injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
+  [cfg.userContentController addScriptMessageHandler:page name:@"nx"];
+  WKWebView *web=[[WKWebView alloc] initWithFrame:page.bounds configuration:cfg];web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;web.navigationDelegate=page;
+  page.web=web;[page addSubview:web];page.wantsLayer=YES;page.layer.backgroundColor=NSColor.blackColor.CGColor;
+  NSButton *close=[NSButton buttonWithTitle:@(TOTK_UI("关闭 (Esc / B)","Close (Esc / B)")) target:page action:@selector(finish)];
+  close.frame=NSMakeRect(cv.bounds.size.width-170,cv.bounds.size.height-44,156,30);close.autoresizingMask=NSViewMinXMargin|NSViewMinYMargin;[page addSubview:close];
+  __weak TOTKPageView *weakPage=page;
+  page.done=^{TOTKPageView *p=weakPage;[p.web.configuration.userContentController removeScriptMessageHandlerForName:@"nx"];[p removeFromSuperview];
+   [window makeFirstResponder:window.contentView];runtime_input_clear();dispatch_semaphore_signal(sem);};
+  [cv addSubview:page];openPage=page;runtime_input_clear();
+  NSURL *root=[NSURL fileURLWithPath:[NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:@"manual/html-document"] isDirectory:YES];
+  NSURL *url=[NSURL URLWithString:[[NSURL fileURLWithPath:file].absoluteString stringByAppendingString:query]];
+  [web loadFileURL:url?:[NSURL fileURLWithPath:file] allowingReadAccessToURL:root];
+  page.prev=~0ull;   /* buttons held when the page opens (the Y that opened it) do not count */
+  page.pad=[NSTimer timerWithTimeInterval:1.0/60 target:page selector:@selector(poll) userInfo:nil repeats:YES];
+  [NSRunLoop.mainRunLoop addTimer:page.pad forMode:NSRunLoopCommonModes];
+  if(!assume_focus()){[NSApp activateIgnoringOtherApps:YES];[window makeKeyAndOrderFront:nil];}
+  [window makeFirstResponder:page];
+  fprintf(stderr,"[ssbu] offline page shown: %s\n",file.UTF8String);
+ });
+ dispatch_semaphore_wait(sem,DISPATCH_TIME_FOREVER);
+ fprintf(stderr,"[ssbu] offline page closed\n");
+ return 1;
+}
+void runtime_front_offline_test(const char *op){
+ NSString *o=[NSString stringWithUTF8String:op?op:""]?:@"";
+ dispatch_async(dispatch_get_main_queue(), ^{
+  TOTKPageView *page=openPage;if(!page){fprintf(stderr,"[ssbu] offline page test: no page is open\n");return;}
+  if([o hasPrefix:@"shot "]){NSString *path=[o substringFromIndex:5];
+   [page.web takeSnapshotWithConfiguration:nil completionHandler:^(NSImage *img,NSError *err){
+    NSBitmapImageRep *rep=img?[[NSBitmapImageRep alloc] initWithData:img.TIFFRepresentation]:nil;
+    BOOL ok=[[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES];
+    fprintf(stderr,"[ssbu] offline page test: picture %s %s%s\n",path.UTF8String,ok?"written":"FAILED ",ok?"":(err.localizedDescription?:@"").UTF8String);}];}
+  else if([o isEqualToString:@"close"])[page finish];
+  else if([o isEqualToString:@"back"])[page back];
+ });
 }
 static int viReady;
 static unsigned displayIdentity,layerIdentity;

@@ -29,8 +29,12 @@ NODE = 0x4000
 CHUNK = 8 << 20
 
 
-def program_header(f, entries, keys, title):
-    """The single Program NCA of `title`. Sparse sections may end past the stored NCA, so bounds are checked per layer."""
+CONTENT_TYPES = {'program': 0, 'html-document': 3}   # NCA content type: the game's RomFS, or its offline manual (Y Help)
+
+
+def program_header(f, entries, keys, title, content_type=0):
+    """The single NCA of `title` with this content type (default Program). Sparse sections may end past the stored NCA,
+    so bounds are checked per layer."""
     found = []
     for name, offset, length in entries:
         if not name.lower().endswith('.nca') or name.lower().endswith('.cnmt.nca'):
@@ -40,9 +44,9 @@ def program_header(f, entries, keys, title):
                        for i in range(6))
         require(hdr[0x200:0x204] == b'NCA3', 'Expected NCA3 (check prod.keys and the game file)')
         require(struct.unpack_from('<Q', hdr, 0x208)[0] == length, 'NCA size does not match container entry')
-        if hdr[0x205] == 0 and f'{struct.unpack_from("<Q", hdr, 0x210)[0]:016X}' == title:
+        if hdr[0x205] == content_type and f'{struct.unpack_from("<Q", hdr, 0x210)[0]:016X}' == title:
             found.append((dict(name=name, nca_offset=offset, size=length), hdr))
-    require(len(found) == 1, f'Expected one Program NCA for {title}')
+    require(len(found) == 1, f'Expected one NCA of content type {content_type} for {title}')
     return found[0]
 
 
@@ -258,10 +262,10 @@ def verify_ivfc(fs, size, read, image_path, on_level5_chunk=None):
     return counts, levels[-1][1], digest.hexdigest()
 
 
-def open_program(path, keys, title, writable=False):
+def open_program(path, keys, title, writable=False, content_type=0):
     f = path.open('r+b' if writable else 'rb')
     _, entries = container_entries(f, path.stat().st_size)
-    record, hdr = program_header(f, entries, keys, title)
+    record, hdr = program_header(f, entries, keys, title, content_type)
     key = nca_ctr_key(hdr, keys, common_tickets(f, entries))
     return f, record, hdr, Ctr(f, record['nca_offset'], record['size'], key)
 
@@ -300,13 +304,16 @@ def main():
     parser.add_argument('--keys', required=True, type=Path)
     parser.add_argument('--title', default=BASE_TITLE, help='program title ID (default: Super Smash Bros. Ultimate, program 0)')
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--content', choices=sorted(CONTENT_TYPES), default='program',
+                        help='which NCA to merge: the game RomFS (default) or the offline manual (html-document)')
     parser.add_argument('--reclaim-base', action='store_true',
                         help='punch APFS holes in base NSP as chunks complete during level 5 merge')
     args = parser.parse_args()
     require(not args.output.exists(), 'Output already exists; choose a new directory')
     keys = load_keys(args.keys)
-    bf, brec, bhdr, bctr = open_program(args.base, keys, args.title, writable=args.reclaim_base)
-    uf, urec, uhdr, uctr = open_program(args.update, keys, args.title)
+    kind = CONTENT_TYPES[args.content]
+    bf, brec, bhdr, bctr = open_program(args.base, keys, args.title, writable=args.reclaim_base, content_type=kind)
+    uf, urec, uhdr, uctr = open_program(args.update, keys, args.title, content_type=kind)
     with bf, uf:
         base = open_base_romfs(bctr, *romfs_section(bhdr))
         ustart, uend, ufs = romfs_section(uhdr)

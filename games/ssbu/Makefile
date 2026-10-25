@@ -42,7 +42,7 @@ $(OUT)/ssbu-native: $(RUNTIME_SRC) $(RUNTIME_HEADERS) $(GENERATED) $(GFX_OBJECTS
 	  $(RUNTIME_SRC) $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a \
 	  -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics \
 	  -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation \
-	  -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+	  -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -framework WebKit -o "$@"
 
 runtime: $(OUT)/ssbu-native
 
@@ -74,7 +74,7 @@ boot: runtime
 
 # The player's mods, made into checked tables: exefs patches (mods/13.0.4/<name>/exefs/*.pchtxt) -> <work>/patches,
 # RomFS mods (mods/<name>/romfs/...) -> their manifest.tsv (sizes and SHA-256 of the replacements and the originals).
-.PHONY: patches mods nros dlc app
+.PHONY: patches mods nros dlc manual app
 patches:
 	"$(PY)" scripts/prepare_patches.py --work "$(WORK)" --expected "$(EXPECTED)"
 mods:
@@ -92,6 +92,18 @@ DLC ?=
 dlc:
 	@[ -n "$(DLC)" ] && [ -n "$(KEYS)" ] || { echo "make dlc DLC=<folder of add-on NSPs> KEYS=<prod.keys>"; exit 1; }
 	"$(PY)" scripts/extract_dlc.py --keys "$(KEYS)" --input "$(DLC)" --output "$(WORK)/dlc"
+
+# The offline manual (Y Help in the menus): the HtmlDocument NCA of the base game merged with the update's patch,
+# verified, unpacked to <work>/manual; the runtime shows its pages over the game (runtime/frontend.m).
+#   make manual BASE=<base game NSP> UPDATE=<update NSP> KEYS=<prod.keys>
+BASE ?=
+UPDATE ?=
+manual:
+	@[ -n "$(BASE)" ] && [ -n "$(UPDATE)" ] && [ -n "$(KEYS)" ] || { echo "make manual BASE=<base NSP> UPDATE=<update NSP> KEYS=<prod.keys>"; exit 1; }
+	rm -rf "$(WORK)/manual-image" "$(WORK)/manual"
+	"$(PY)" scripts/merge_romfs.py "$(BASE)" "$(UPDATE)" --keys "$(KEYS)" --content html-document --output "$(WORK)/manual-image"
+	"$(PY)" scripts/unpack_romfs.py "$(WORK)/manual-image" --output "$(WORK)/manual"
+	rm -rf "$(WORK)/manual-image"
 
 # The app: a small launcher bundle (settings window with presets, then the game) that runs the game from the work
 # folder, which it names in Info.plist (SSBUWorkFolder): nothing large is copied. Its icon comes from the game's own

@@ -86,6 +86,31 @@ static uint32_t ssl_unavailable(void) { return SSL_UNAVAILABLE; }
 static uint32_t nsa_unavailable(void) { return NSA_UNAVAILABLE; }
 static void nifm_request(void) { static int once; if (!once++) fprintf(stderr, "[ssbu-net] network request: offline\n"); }
 static int64_t network_clock_now(void) { return (int64_t)time(NULL); }   /* time_point: seconds since the epoch */
+/* nn::web::ShowOfflineHtmlPage: the game's offline manual (Y Help). The argument is the web applet's TLV storage
+   (u16 entry count at 0, entries from 8: u16 type, u16 size, u32 pad, data); type 6 is the document path, relative to the
+   manual's html-document folder. The page opens over the game (runtime_front_offline_page, the manual unpacked by
+   make manual) and this call returns when the player closes it, as the applet does. Return value: u32 exit reason
+   (1 = closed with back), u32 pad, last URL (0x1000), u64 its size. */
+static uint32_t offline_html_page(uint8_t *ret, const uint8_t *arg) {
+    if (!arg) runtime_fail("offline page argument");
+    char path[0xc01] = {0};
+    uint16_t count; memcpy(&count, arg, 2);
+    size_t at = 8;
+    for (unsigned i = 0; i < count && i < 64 && at + 8 <= 0x2000; i++) {
+        uint16_t type, size; memcpy(&type, arg + at, 2); memcpy(&size, arg + at + 2, 2);
+        if (at + 8 + size > 0x2000) break;
+        if (type == 6) { memcpy(path, arg + at + 8, size < sizeof path - 1 ? size : sizeof path - 1); path[sizeof path - 1] = 0; }
+        at += 8 + size;
+    }
+    if (!*path) { fprintf(stderr, "[ssbu] offline page: no document path in the argument (%u entries)\n", count); return RES_FAIL; }
+    fprintf(stderr, "[ssbu] offline page: %s\n", path);
+    int away = runtime_core_away();   /* the other guest threads keep running while the page is open */
+    int shown = runtime_front_offline_page(path);
+    runtime_core_back(&away);
+    if (!shown) return RES_FAIL;
+    if (ret) { memset(ret, 0, 0x1010); uint32_t reason = 1; memcpy(ret, &reason, 4); }
+    return 0;
+}
 static void environment_identifier(char *out) { if (!out) runtime_fail("nsd environment output"); memset(out, 0, 8); memcpy(out, "lp1", 3); }
 static void execute_program(int index, const void *param, uint64_t size) {
     (void)param; fprintf(stderr, "[ssbu] nn::oe::ExecuteProgram(%d, %llu bytes)\n", index, (unsigned long long)size);
@@ -638,7 +663,7 @@ void *runtime_ssbu_override(const char *name) {
         {"_ZN2nn2ec19ShopServiceAccessor13AsyncResponse7TryWaitEv", ret_true},
         {"_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPageArgE", fail},
         {"_ZN2nn3web13ShowLobbyPageEPNS0_20LobbyPageReturnValueERKNS0_16ShowLobbyPageArgE", fail},
-        {"_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE", fail},
+        {"_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE", offline_html_page},
         {"_ZN2nn3web16ShowYouTubeVideoEPNS0_18WebPageReturnValueERKNS0_19ShowYouTubeVideoArgE", fail},
         {"_ZN2nn3pdm30QueryApplicationPlayStatisticsEPNS0_25ApplicationPlayStatisticsEPKNS_13ApplicationIdEi", pdm_play_stats},
 
