@@ -445,14 +445,22 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
 @end
 @implementation TOTKPageView
 -(void)userContentController:(WKUserContentController *)c didReceiveScriptMessage:(WKScriptMessage *)m{(void)c;(void)m;[self finish];}
--(void)finish{[self.pad invalidate];self.pad=nil;void(^d)(void)=self.done;self.done=nil;if(d)d();}
+-(void)finish{[self.pad invalidate];self.pad=nil;void(^d)(void)=self.done;self.done=nil;if(!d)return;
+ [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c){c.duration=0.15;self.animator.alphaValue=0;} completionHandler:d];}
 -(void)back{if(self.web.canGoBack)[self.web goBack];else [self finish];}
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)layout{[super layout];   /* the pages are laid out for the Switch's 1280x720 screen: scale them to the window */
- NSSize z=self.bounds.size;self.web.pageZoom=fmax(0.25,fmin(z.width/1280,z.height/720));}
+-(void)layout{[super layout];   /* the pages are laid out for the Switch's 1280x720 screen: the largest 16:9 area of the window,
+   centered (black around it), so nothing the pages keep below the screen shows */
+ NSSize z=self.bounds.size;CGFloat k=fmax(0.25,fmin(z.width/1280,z.height/720));
+ self.web.frame=NSMakeRect(floor((z.width-1280*k)/2),floor((z.height-720*k)/2),round(1280*k),round(720*k));self.web.pageZoom=k;}
 -(void)cancelOperation:(id)sender{(void)sender;[self back];}
 -(void)keyDown:(NSEvent *)e{if(e.keyCode==53)[self back];else [super keyDown:e];}
--(void)webView:(WKWebView *)w didFinishNavigation:(WKNavigation *)n{(void)n;[w.window makeFirstResponder:w];}
+-(void)webView:(WKWebView *)w didFailProvisionalNavigation:(WKNavigation *)n withError:(NSError *)e{
+ fprintf(stderr,"[ssbu] offline page: load failed: %s\n",e.localizedDescription.UTF8String);self.alphaValue=1;(void)w;(void)n;}
+-(void)webView:(WKWebView *)w didFinishNavigation:(WKNavigation *)n{(void)n;[w.window makeFirstResponder:w];
+ /* shown once the page has drawn (no white first frame), faded in like the applet */
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(80*NSEC_PER_MSEC)),dispatch_get_main_queue(),^{
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c){c.duration=0.2;self.animator.alphaValue=1;} completionHandler:nil];});}
 -(void)poll{   /* every controller: B back, D-pad / left stick scroll (the game is waiting, so its reads are not disturbed) */
  uint64_t b=0;int32_t ly=0;
  for(int s=0;s<RUNTIME_GAMEPAD_SLOTS;s++){RuntimeGamepadState g;runtime_gamepad_read_slot(s,&g);b|=g.buttons;if(abs(g.ly)>abs(ly))ly=g.ly;}
@@ -498,12 +506,13 @@ int runtime_front_offline_page(const char *document_path){
    [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:css options:NSJSONWritingFragmentsAllowed error:nil] encoding:NSUTF8StringEncoding]];
   [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:fontScript injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
   [cfg.userContentController addScriptMessageHandler:page name:@"nx"];
-  WKWebView *web=[[WKWebView alloc] initWithFrame:page.bounds configuration:cfg];web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;web.navigationDelegate=page;
+  WKWebView *web=[[WKWebView alloc] initWithFrame:page.bounds configuration:cfg];web.navigationDelegate=page;
+  [web setValue:@NO forKey:@"drawsBackground"];web.underPageBackgroundColor=NSColor.blackColor;
   page.web=web;[page addSubview:web];page.wantsLayer=YES;page.layer.backgroundColor=NSColor.blackColor.CGColor;
   __weak TOTKPageView *weakPage=page;
   page.done=^{TOTKPageView *p=weakPage;[p.web.configuration.userContentController removeScriptMessageHandlerForName:@"nx"];[p removeFromSuperview];
    [window makeFirstResponder:window.contentView];runtime_input_clear();dispatch_semaphore_signal(sem);};
-  [cv addSubview:page];openPage=page;runtime_input_clear();
+  page.alphaValue=0;[cv addSubview:page];openPage=page;runtime_input_clear();
   NSURL *root=[NSURL fileURLWithPath:[NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:@"manual/html-document"] isDirectory:YES];
   NSURL *url=[NSURL URLWithString:[[NSURL fileURLWithPath:file].absoluteString stringByAppendingString:query]];
   [web loadFileURL:url?:[NSURL fileURLWithPath:file] allowingReadAccessToURL:root];
@@ -527,6 +536,8 @@ void runtime_front_offline_test(const char *op){
     NSBitmapImageRep *rep=img?[[NSBitmapImageRep alloc] initWithData:img.TIFFRepresentation]:nil;
     BOOL ok=[[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES];
     fprintf(stderr,"[ssbu] offline page test: picture %s %s%s\n",path.UTF8String,ok?"written":"FAILED ",ok?"":(err.localizedDescription?:@"").UTF8String);}];}
+  else if([o isEqualToString:@"frame"])fprintf(stderr,"[ssbu] offline page test: view %.0fx%.0f, page at %.0f,%.0f %.0fx%.0f, zoom %.3f, alpha %.2f\n",
+   page.bounds.size.width,page.bounds.size.height,page.web.frame.origin.x,page.web.frame.origin.y,page.web.frame.size.width,page.web.frame.size.height,page.web.pageZoom,page.alphaValue);
   else if([o isEqualToString:@"close"])[page finish];
   else if([o isEqualToString:@"back"])[page back];
  });

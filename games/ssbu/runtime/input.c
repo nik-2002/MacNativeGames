@@ -262,7 +262,7 @@ static void *input_file(void *arg) {
             runtime_frame_step_pin(ms);
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
-        } else if (!strncmp(line, "page ", 5)) {   /* "page shot <path>" / "page back" / "page close": the open manual page (Y Help) */
+        } else if (!strncmp(line, "page ", 5)) {   /* "page shot <path>" / "page frame" / "page back" / "page close": the open manual page (Y Help) */
             line[strcspn(line, "\r\n")] = 0; runtime_front_offline_test(line + 5);
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
         else runtime_fail("invalid diagnostic input command");
