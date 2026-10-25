@@ -1,0 +1,20 @@
+{
+    "_comment": "TEMPLATE ONLY. This scaffold ships no hashes from the game. After extracting your own Super Smash Bros. Ultimate 13.0.4 dump and running the rewrite, generate a local manifest with: python3 scripts/make_expected.py --work SSBU_build --output SSBU_build/expected-v13.0.4.json",
+    "status": "template",
+    "title_id": "01006A800016E000",
+    "update_title_id": "01006A800016E800",
+    "version": null,
+    "display_version": "13.0.4",
+    "main_build_id": null,
+    "base_program_nca": null,
+    "update_program_nca": null,
+    "exefs_sha256": {},
+    "rewritten_sha256": {},
+    "romfs": {
+        "size": null,
+        "sha256": null,
+        "files": null,
+        "bytes_from_base": null,
+        "bytes_from_update": null
+    }
+}
