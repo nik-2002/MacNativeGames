@@ -282,11 +282,10 @@ NVN(nvnCommandBufferSetConservativeRasterDilate, void, NVNcommandBuffer *c, floa
 NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) {
     (void)c; if ((m & 0xffff) != 0xffff) { static int once; if (!once++) LOG("【红】SetSampleMask %#x: fixed-function sample mask not applied", m); }
 }
-NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) {
-    (void)c;
-    static int ar_log;
-    if (ar_log++ < 20) LOG("[ssbu-alpha] nvnCommandBufferSetAlphaRef: r = %f", r);
-}
+/* SSBU: the alpha test reference is command buffer state, replayed in order (OP_ALPHA_REF); the alpha test itself is
+   a fragment specialisation (nvn_mtl.m fs_fn_alpha_test). */
+void nvn_rec_alpha_ref(NVNcommandBuffer *c, float r);
+NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { nvn_rec_alpha_ref(c, r); }
 /* Metal always restarts strips at the all-ones index; other restart indices are reported. */
 NVN(nvnCommandBufferSetPrimitiveRestart, void, NVNcommandBuffer *c, uint32_t e, int index) {
     (void)c; if ((e & 0xff) && index != -1 && index != 0xffff) { static int once; if (!once++) LOG("【红】SetPrimitiveRestart index %#x: Metal restarts only at the all-ones index", index); }

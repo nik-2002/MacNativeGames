@@ -4684,7 +4684,7 @@ static void shmap_load(void) {
     tex_slot_cache tex_slots;
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass：编这块参数的渲染通道序号——只在同一通道内复用（跨通道 / 跨提交的块所在 arena 可能已回收重写） | ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; id<MTLFunction> no_depth_fn;
-    NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen; id<MTLFunction> atest_fn[2]; uint8_t atest_tried[2]; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
+    NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; NSMutableDictionary<NSString *, id<MTLFunction>> *bpatch; int border_seen; NSMutableDictionary<NSString *, id> *atest; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
 @implementation NvShader @end
 /* TOTK: a shader's MSL source is needed only to build derived functions (varying patches, layered vertex, depth-less and
    MetalFX UI fragment variants). The Mac keeps it; iOS keeps only the path and reads it when needed (thousands of sources
@@ -5625,6 +5625,7 @@ static struct {
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard;
     float blend_color[4]; int64_t copy_stride;
+    float alpha_ref;   // SSBU: nvnCommandBufferSetAlphaRef (OP_ALPHA_REF)
 } S;
 // No render target set: no colour target and no depth / stencil (a pass of rasterization only, see rp_begin_ex)
 static int rt_none(void) {
@@ -6100,31 +6101,39 @@ static id<MTLFunction> fs_fn_mfx(NvShader *fs, int role, int nodepth) {
     }
     id<MTLFunction> fn = fs->mfx_fn[idx]; os_unfair_lock_unlock(&lock); return fn;
 }
-static NSString *fs_src_with_alpha_test(NvShader *fs, int nodepth) {
+/* SSBU: NVN's fixed-function alpha test (nvnColorStateSetAlphaTest + nvnCommandBufferSetAlphaRef), which Metal does not
+   have: the fragment function is rebuilt to discard when colour 0's alpha fails the comparison with the reference. The UI
+   draws its masks as textured quads with the alpha test on, writing the stencil only where the mask texture is opaque;
+   without the test every mask wrote its whole quad, and highlights and panels spilled past their shapes (2026-10-25).
+   func: NVN_ALPHA_FUNC_NEVER (1) .. GEQUAL (7); ALWAYS and 0 never get here. */
+static NSString *fs_src_with_alpha_test(NvShader *fs, int nodepth, unsigned func, float ref) {
     NSString *src = (nodepth && fs->writes_depth) ? fs_src_without_depth(fs) : sh_src(fs);
     if (!src) return nil;
     NSRegularExpression *c0 = [NSRegularExpression regularExpressionWithPattern:@"\\n\\s*(\\w+)\\s+(\\w+)\\s*\\[\\[color\\(0\\)\\]\\]\\s*;" options:0 error:nil];
     NSTextCheckingResult *m = [c0 firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
     if (!m) return nil;
-    NSString *name = [src substringWithRange:[m rangeAtIndex:2]];
-    NSString *discard_stmt = [NSString stringWithFormat:@"if (out.%@.w <= 0.0) discard_fragment();\n    return out;", name];
+    NSString *type = [src substringWithRange:[m rangeAtIndex:1]], *name = [src substringWithRange:[m rangeAtIndex:2]];
+    if (![type hasSuffix:@"4"]) return nil;   // no alpha channel to test
+    static const char *const pass[8] = {NULL, "false", "<", "==", "<=", ">", "!=", ">="};
+    NSString *keep = func == 1 ? @"false" : [NSString stringWithFormat:@"(float(out.%@.w) %s float(%.9e))", name, pass[func], ref];
+    NSString *discard_stmt = [NSString stringWithFormat:@"if (!%@) discard_fragment();\n    return out;", keep];
     return [src stringByReplacingOccurrencesOfString:@"return out;" withString:discard_stmt];
 }
-static id<MTLFunction> fs_fn_alpha_test(NvShader *fs, int nodepth) {
-    if (!fs || !sh_has_src(fs)) return nil;
-    int idx = (nodepth && fs->writes_depth) ? 1 : 0;
+static id<MTLFunction> fs_fn_alpha_test(NvShader *fs, int nodepth, unsigned func, float ref) {
+    if (!fs || !sh_has_src(fs) || func < 1 || func > 7) return nil;
+    nodepth = nodepth && fs->writes_depth;
+    NSString *k = [NSString stringWithFormat:@"%u/%.9g/%d", func, ref, nodepth];
     static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT; os_unfair_lock_lock(&lock);
-    if (!fs->atest_tried[idx]) {
-        fs->atest_tried[idx] = 1;
-        NSString *src = fs_src_with_alpha_test(fs, nodepth);
-        if (src) {
-            NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(src, &err);
-            fs->atest_fn[idx] = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
-            if (!fs->atest_fn[idx]) MLOG("【红】alpha test 片元特化失败 %s：%s", fs->key, err.localizedDescription.UTF8String);
-            else MLOG("[ssbu] alpha test fragment specialized for %s (nodepth=%d)", fs->key, nodepth);
-        }
+    if (!fs->atest) fs->atest = [NSMutableDictionary dictionary];
+    id have = fs->atest[k];
+    if (!have) {
+        NSString *src = fs_src_with_alpha_test(fs, nodepth, func, ref);
+        NSError *err = nil; id<MTLLibrary> lib = src ? totk_msl_library(src, &err) : nil;
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+        if (!fn) { static int said; if (said++ < 12) MLOG("【红】alpha test %u ref %g: fragment shader %s %s", func, ref, fs->key, src ? err.localizedDescription.UTF8String : "has no float4 colour 0 (drawn without the test)"); }
+        have = fn ? (id)fn : (id)NSNull.null; fs->atest[k] = have;
     }
-    id<MTLFunction> fn = fs->atest_fn[idx]; os_unfair_lock_unlock(&lock); return fn;
+    id<MTLFunction> fn = have == NSNull.null ? nil : have; os_unfair_lock_unlock(&lock); return fn;
 }
 /* Diagnostic TOTK_NAN_TRACE=<fragment key prefix> (log TOTK_NAN_TRACE_LOG, default analysis/nan-trace.tsv): those fragment
    shaders are rebuilt so that every float temporary is checked right after it is computed, and the number of the first
@@ -6386,9 +6395,9 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0) : nil;   // TOTK: sampler border colour emulation
     if (bfn) k.fsfn = (__bridge void *)bfn;
     __unsafe_unretained id<MTLFunction> atfn = nil;
-    if (!k.fsfn && S.color.alpha_func == NVN_ALPHA_FUNC_GREATER && fs && !strncmp(fs->key, "8bbc96bf", 8)) {
-        atfn = fs_fn_alpha_test(fs, k.dfmt == 0);
-        if (atfn) k.fsfn = (__bridge void *)atfn;
+    if (fs && S.color.alpha_func >= NVN_ALPHA_FUNC_NEVER && S.color.alpha_func < NVN_ALPHA_FUNC_ALWAYS) {
+        if (k.fsfn) { static int said; if (!said++) MLOG("【红】alpha test with a border-colour or layer fragment variant: drawn without the test (fragment %s)", fs->key); }
+        else { atfn = fs_fn_alpha_test(fs, k.dfmt == 0, S.color.alpha_func, S.alpha_ref); if (atfn) k.fsfn = (__bridge void *)atfn; }
     }
     { float bc[8][4]; int ba[8], bn; if (border_key(vs, 0, bc, ba, &bn)) k.a2c |= PSO_VBORDER; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
@@ -7557,7 +7566,7 @@ static int lay_scan(const uint8_t *start, const p_set_rt *rt, int first, int nla
             case OP_UPDATE_UB: case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_COND: case OP_RENDER_ENABLE: case OP_CLEAR_COLOR:
             case OP_DRAW: case OP_DRAW_IDX: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE:
             case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP:
-            case OP_BIND_IMG: case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_COPY_STRIDE: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD:
+            case OP_BIND_IMG: case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_COPY_STRIDE: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD:
             case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: continue;
             default: return hi;   // copies, dispatches, texture / depth-stencil clears, events
         }
@@ -7723,6 +7732,7 @@ static int state_op(uint32_t op, const void *a) {
         case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n; i++) memcpy(S.vp[b->first + i], b->v[i], 16); S.has_vp = 1; break; }
         case OP_DEPTH_RANGE: { const p_depth_range *b = a; S.dr[0] = b->n; S.dr[1] = b->f; break; }
         case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
+        case OP_ALPHA_REF: { float r = ((const p_alpha_ref *)a)->ref; if (r != S.alpha_ref) { S.alpha_ref = r; g_pso_dirty = 1; } break; }
         case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_flag *)a)->value; break;
         case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value; break;
@@ -9923,7 +9933,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             }
         }
     }
-    if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS)) {
+    if (S.color.logic_op != NVN_LOGIC_OP_COPY) {   // SSBU: the alpha test is emulated (fs_fn_alpha_test); logic ops are not
         static int at_log;
         if (at_log++ < 20) MLOG("【红】alpha test %u / logic op %u: vs=%s ps=%s rt0=%p fmt=%#x %ux%u blend_en=%u",
                                 S.color.alpha_func, S.color.logic_op,
@@ -10086,7 +10096,7 @@ frz_plain:;
         }
     }
     enc_r_scissor(en, sc);
-    if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS)) {
+    if (S.color.logic_op != NVN_LOGIC_OP_COPY) {   // SSBU: the alpha test is emulated (fs_fn_alpha_test); logic ops are not
         static int at_log;
         if (at_log++ < 20) MLOG("【红】alpha test %u / logic op %u: vs=%s ps=%s rt0=%p fmt=%#x %ux%u blend_en=%u",
                                 S.color.alpha_func, S.color.logic_op,
@@ -11072,7 +11082,7 @@ void mtl_exec(const uint8_t *p) {
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
             case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
-            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_COPY_STRIDE: case OP_DEPTH_CLAMP: case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_RENDER_COND:
+            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_COPY_STRIDE: case OP_DEPTH_CLAMP: case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_RENDER_COND:
                 state_op(h.op, a); break;
             case OP_COPY_B2T: copy_b2t(a); break;
             case OP_COPY_T2B: copy_t2b(a); break;
