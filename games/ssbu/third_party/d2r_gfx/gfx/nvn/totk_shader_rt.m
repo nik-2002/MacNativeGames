@@ -307,6 +307,10 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
 /* SSBU shader prefetch (nvn_mtl.m mtl_prog_prefetch): translate a shader the game has just set, with the answers most draws
    give, unless the cache already holds a variant of it (the draw then picks or makes the variant it needs). Returns the
    variant or nil. */
+int totk_rt_has_variant(NSString *shader) {   /* the cache has a translation of this shader (any answers) */
+    pthread_mutex_lock(&g_rt_lock); NSUInteger have = variants_of(shader).count; pthread_mutex_unlock(&g_rt_lock);
+    return have > 0;
+}
 NSString *totk_rt_prefetch(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local) {
     if (no_translator()) return nil;
     /* A draw that needs the translator goes first (the prefetch has its own translator and holds the shared lock only to

@@ -443,6 +443,9 @@ int main(int argc,char **argv) {
  for(unsigned i=0;i<8;i++)need(pthread_key_create(&runtime_keys[i],NULL)==0&&runtime_keys[i]!=0,"allocate Darwin key");
  runtime_hle_stack_init((uint64_t)runtime_keys[4]*8);
  need(pthread_key_create(&environment_key,environment_destroy)==0,"thread environment key");
+ /* "shader-sweep": translate the shader pack SSBU_SHADER_PACK names (make shaders) into the cache, then exit. */
+ if(!strcmp(argv[2],"shader-sweep")){const char *pack=getenv("SSBU_SHADER_PACK");need(pack&&*pack,"shader-sweep needs SSBU_SHADER_PACK=<pack>");
+  extern int mtl_shader_sweep(const char *);return mtl_shader_sweep(pack)<0;}
  runtime_nro_set_rewritten_dir(argv[1]);
  for(unsigned i=0;i<NM;i++)map_module(&modules[i],argv[1]);
  for(unsigned i=0;i<NM;i++)relocate(&modules[i]);

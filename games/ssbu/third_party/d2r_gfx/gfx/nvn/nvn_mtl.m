@@ -5169,6 +5169,7 @@ void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
    state differs translates the variant it needs, as before. The finished library reaches the replay through the warm-up's
    hand-over (warm_enqueue / warm_claim). Nothing is skipped or drawn differently. SSBU_SHADER_PREFETCH=0 turns it off. */
 NSString *totk_rt_prefetch(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local);
+int totk_rt_has_variant(NSString *shader);
 static NvShader *warm_shader_load(NSString *key, int stage);
 static void warm_enqueue(WarmItem *item);
 static NSDictionary *pf_answers(void) {
@@ -5198,6 +5199,51 @@ static void *pf_worker(void *arg) {
     }
     return NULL;
 }
+/* SSBU: translate a whole shader pack (scripts/extract_shaders.py: every shader in data.arc's .nushdb and .eff files)
+   ahead of play, through the same prefetch translation the game's shaders get when it loads them (same keys, same
+   default answers), on SSBU_SWEEP_JOBS worker threads (default: cores - 2, at most 6), each with its own translator.
+   Shaders already in the cache are skipped. Returns the number translated, -1 on a bad pack. */
+int mtl_shader_sweep(const char *path) {
+    NSData *pack = [NSData dataWithContentsOfFile:@(path) options:NSDataReadingMappedIfSafe error:nil];
+    const uint8_t *b = pack.bytes; size_t n = pack.length;
+    if (!b || n < 12 || memcmp(b, "SSBUSHP1", 8)) { fprintf(stderr, "[shader-sweep] %s is not a shader pack\n", path); return -1; }
+    uint32_t count; memcpy(&count, b + 8, 4);
+    typedef struct { uint32_t stage, len; const uint8_t *ctl, *code; } rec_t;
+    rec_t *recs = calloc(count ? count : 1, sizeof *recs); size_t at = 12;
+    for (uint32_t i = 0; i < count; i++) {
+        if (at + 8 + 0x880 > n) { fprintf(stderr, "[shader-sweep] pack truncated at record %u\n", i); free(recs); return -1; }
+        memcpy(&recs[i].stage, b + at, 4); memcpy(&recs[i].len, b + at + 4, 4);
+        recs[i].ctl = b + at + 8; recs[i].code = b + at + 8 + 0x880; at += 8 + 0x880 + recs[i].len;
+        if (at > n) { fprintf(stderr, "[shader-sweep] pack truncated at record %u\n", i); free(recs); return -1; }
+    }
+    const char *je = getenv("SSBU_SWEEP_JOBS"); int jobs = je ? atoi(je) : (int)NSProcessInfo.processInfo.activeProcessorCount - 2;
+    if (jobs < 1) jobs = 1; if (jobs > 6 && !je) jobs = 6;
+    __block _Atomic uint32_t next = 0, done = 0, translated = 0, skipped = 0, failed = 0; uint64_t t0 = bp_now();
+    fprintf(stderr, "[shader-sweep] %u shaders in %s, %d workers, cache %s\n", count, path, jobs, totk_rt_dir().UTF8String);
+    dispatch_group_t g = dispatch_group_create();
+    for (int w = 0; w < jobs; w++) dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (uint32_t i; (i = atomic_fetch_add(&next, 1)) < count; ) @autoreleasepool {
+            const rec_t *r = &recs[i];
+            uint8_t md[32]; CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx); CC_SHA256_Update(&ctx, r->ctl, ctl_key_len(r->ctl)); CC_SHA256_Update(&ctx, r->code, r->len); CC_SHA256_Final(md, &ctx);
+            char k[65]; for (unsigned j = 0; j < 32; j++) snprintf(k + 2 * j, 3, "%02x", md[j]);
+            NSString *v = totk_rt_prefetch(@(k), (int)r->stage, r->ctl, r->code, pf_answers(), r->stage == 5 ? rt_local(r->ctl, 5) : nil);
+            if (v) atomic_fetch_add(&translated, 1);
+            else if (totk_rt_has_variant(@(k))) atomic_fetch_add(&skipped, 1);
+            else atomic_fetch_add(&failed, 1);
+            uint32_t d = atomic_fetch_add(&done, 1) + 1;
+            if (d % 500 == 0 || d == count) {
+                double s = (bp_now() - t0) / 1e9;
+                fprintf(stderr, "[shader-sweep] %u / %u (%u translated, %u already cached, %u failed), %.0f s, about %.0f s left\n",
+                        d, count, atomic_load(&translated), atomic_load(&skipped), atomic_load(&failed), s, s / d * (count - d));
+            }
+        }
+    });
+    dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+    free(recs);
+    fprintf(stderr, "[shader-sweep] done: %u translated, %u already cached, %u failed in %.0f s\n",
+            atomic_load(&translated), atomic_load(&skipped), atomic_load(&failed), (bp_now() - t0) / 1e9);
+    return (int)atomic_load(&translated);
+}
 void mtl_prog_prefetch(const prog_t *p) {
     static int on = -1; if (on < 0) { const char *e = getenv("SSBU_SHADER_PREFETCH"); on = !(e && !strcmp(e, "0")); }
     if (!on || !p) return;
@@ -5213,6 +5259,12 @@ void mtl_prog_prefetch(const prog_t *p) {
         char k[65]; for (unsigned j = 0; j < 32; j++) snprintf(k + 2 * j, 3, "%02x", md[j]);
         NSString *key = @(k);
         @synchronized (seen) { if ([seen containsObject:key]) continue; [seen addObject:key]; }
+        static const char *dump; static int dump_max; static dispatch_once_t donce;
+        dispatch_once(&donce, ^{ dump = getenv("SSBU_SHADER_DUMP"); const char *m = getenv("SSBU_SHADER_DUMP_MAX"); dump_max = m ? atoi(m) : 64; });
+        if (dump && *dump) {   /* SSBU_SHADER_DUMP=<dir>: the first SSBU_SHADER_DUMP_MAX (64) shaders as the game hands them over (<key>.ctl 0x880 bytes, <key>.code) */
+            static _Atomic int dumped; if (atomic_fetch_add(&dumped, 1) < dump_max) {
+                [[NSData dataWithBytes:control length:0x880] writeToFile:[NSString stringWithFormat:@"%s/%@.ctl", dump, key] atomically:YES];
+                [[NSData dataWithBytes:data length:length] writeToFile:[NSString stringWithFormat:@"%s/%@.code", dump, key] atomically:YES]; } }
         NSData *code = [NSData dataWithBytes:data length:length];   // the game may reuse the pool memory later; control is interned
         NSArray *local = st == 5 ? rt_local(control, (int)st) : nil;
         atomic_fetch_add(&g_pf_queued, 1);

@@ -64,6 +64,7 @@ void mtl_cube_merge_stats(uint64_t v[4]);
 int mtl_probe_winding(void);
 int mtl_probe_depth_output(void);
 int mtl_probe_scaled_copy(void);
+int mtl_shader_sweep(const char *pack);   /* SSBU: translate a shader pack ahead of play (scripts/extract_shaders.py) */
 int mtl_probe_tile(void);
 
 uint64_t mtl_last_fence(void);                       // 最近一次提交的栅栏值（0 = 从未提交） | Fence value of the most recent submit (0 = never submitted)

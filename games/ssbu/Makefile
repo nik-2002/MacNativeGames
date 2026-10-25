@@ -106,6 +106,18 @@ manual:
 	"$(PY)" scripts/decode_shared_fonts.py "$(WORK)/extracted/firmware/shared-fonts" --output "$(WORK)/manual/html-document/system-fonts"
 	rm -rf "$(WORK)/manual-image"
 
+# Every shader in data.arc (the .nushdb model shaders and each fighter's / stage's .eff effect shaders), translated and
+# compiled before play, so a fighter or stage met for the first time does not hitch: extract_shaders.py writes the pack,
+# the runtime's shader-sweep translates it into the shader cache, prepare_shader_libs.py compiles it. CACHE_ROOT is
+# where the app keeps its shaders (the launcher's SSBU_CACHE_ROOT). About half an hour the first time; reruns skip what
+# is cached.
+CACHE_ROOT ?= $(HOME)/Library/Application Support/MacNativeGames/SSBU
+.PHONY: shaders
+shaders: runtime shader-tools
+	"$(PY)" scripts/extract_shaders.py "$(WORK)/extracted/v1304/romfs/romfs.bin" --output "$(WORK)/shader-pack.bin"
+	cd "$(WORK)" && SSBU_CACHE_ROOT="$(CACHE_ROOT)" SSBU_SHADER_PACK="$(abspath $(WORK))/shader-pack.bin" ./build/ssbu-native rewritten/v1304 shader-sweep
+	"$(PY)" scripts/prepare_shader_libs.py --cache-root "$(CACHE_ROOT)"
+
 # The app: a small launcher bundle (settings window with presets, then the game) that runs the game from the work
 # folder, which it names in Info.plist (SSBUWorkFolder): nothing large is copied. Its icon comes from the game's own
 # control data (GAME=<base or update NSP> KEYS=<prod.keys>), or the app goes without one.
