@@ -36,6 +36,7 @@ static pthread_mutex_t g_rt_lock = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *g_variants;
 static NSMutableSet<NSString *> *g_msl_checked;
 static FILE *g_svc_in, *g_svc_out;
+static __thread FILE *g_pf_in, *g_pf_out;   // SSBU: each shader prefetch worker's own translator, so draws never wait behind them
 static NSString *g_root, *g_dir;
 static uint64_t g_translated;
 /* The bottom-left box (nvn_mtl.m shader_overlay_prepare): variants new to the cache this run, when the last one came,
@@ -97,8 +98,8 @@ NSString *totk_rt_dir(void) {
     return g_dir;
 }
 
-static void service_start(void) {
-    if (g_svc_in) return;
+static void service_spawn(FILE **pin, FILE **pout) {
+    if (*pin) return;
     NSString *r = root_dir();
     int to[2], from[2];
     if (pipe(to) || pipe(from)) die("shader service pipes");
@@ -114,27 +115,36 @@ static void service_start(void) {
     int have_native = access(native.fileSystemRepresentation, X_OK) == 0;
     int use_native = have_native && !(xe && *xe) && !(want && !strcmp(want, "python"));
     if (want && !strcmp(want, "native") && !use_native) die("TOTK_SHADER_SERVICE=native but %s is not there (make shader-service)", native.UTF8String);
+    /* SSBU: an empty signal mask and default handlers for the service, whatever thread starts it. posix_spawn hands the
+       caller's mask to the child; started from a GCD worker (the shader prefetch), which blocks every signal, the .NET
+       translator never got SIGCHLD, never reaped spirv-cross and waited for it forever, and every draw waited on its
+       lock (2026-10-25: the window stopped drawing after the first frame). */
+    posix_spawnattr_t sa; posix_spawnattr_init(&sa);
+    sigset_t none, all; sigemptyset(&none); sigfillset(&all);
+    posix_spawnattr_setsigmask(&sa, &none); posix_spawnattr_setsigdefault(&sa, &all);
+    posix_spawnattr_setflags(&sa, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
     pid_t pid;
     if (use_native) {
         const char *argv[] = {native.UTF8String, "--service", "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String,
                               "--chain", DMSH_CHAIN, NULL};
-        if (posix_spawn(&pid, argv[0], &fa, NULL, (char *const *)argv, environ)) die("start shader service %s", argv[0]);
+        if (posix_spawn(&pid, argv[0], &fa, &sa, (char *const *)argv, environ)) die("start shader service %s", argv[0]);
         if (dm) LOG("[shader] native translator, DebugMode %s", dm);
     } else {
         NSString *script = [r stringByAppendingString:@"/scripts/shader_service.py"], *dotnet = [r stringByAppendingString:@"/tooling/dotnet/dotnet"];
         NSString *xlate = xe && *xe ? @(xe) : [r stringByAppendingString:@"/build/totk_xlate/totk_xlate.dll"];
         const char *argv[] = {"python3", "-I", script.UTF8String, "--dotnet", dotnet.UTF8String, "--xlate", xlate.UTF8String,
                               "--spirv-cross", sc.UTF8String, "--out", totk_rt_dir().UTF8String, "--chain", DMSH_CHAIN, NULL};
-        if (posix_spawnp(&pid, "python3", &fa, NULL, (char *const *)argv, environ)) die("start shader service");
+        if (posix_spawnp(&pid, "python3", &fa, &sa, (char *const *)argv, environ)) die("start shader service");
         if (xe || dm) LOG("[shader] translator %s, DebugMode %s", xlate.UTF8String, dm ? dm : "default");
     }
-    posix_spawn_file_actions_destroy(&fa);
+    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&sa);
     close(to[0]); close(from[1]);
-    g_svc_in = fdopen(to[1], "w"); g_svc_out = fdopen(from[0], "r");
-    if (!g_svc_in || !g_svc_out) die("shader service streams");
+    *pin = fdopen(to[1], "w"); *pout = fdopen(from[0], "r");
+    if (!*pin || !*pout) die("shader service streams");
     LOG("[shader] runtime translation service started (pid %d, %s), cache %s", pid,
         use_native ? "native build/shader-service/totk_xlate" : "python3 scripts/shader_service.py + .NET", totk_rt_dir().UTF8String);
 }
+static void service_start(void) { service_spawn(&g_svc_in, &g_svc_out); }
 
 static NSString *hex(const uint8_t *p, size_t n) {
     NSMutableString *s = [NSMutableString stringWithCapacity:n * 2];
@@ -177,7 +187,9 @@ static int no_translator(void) {
     return v;
 #endif
 }
-NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local) {
+/* quiet (SSBU shader prefetch): a translation that fails returns nil instead of stopping the game; the draw that needs the
+   shader later translates it as before and reports any failure then. */
+static NSString *rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local, int quiet) {
     uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     pthread_mutex_lock(&g_rt_lock);
     NSMutableArray *vs = variants_of(shader);
@@ -232,12 +244,16 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     return nil;
     }
     BOOL existed = [NSFileManager.defaultManager fileExistsAtPath:[ssbu_rt_dir() stringByAppendingFormat:@"/%@_b.metal", variant]];   // a re-translation of a broken variant is not a new one
-    service_start();
-    fprintf(g_svc_in, "%s\n", json_string(rq).UTF8String); fflush(g_svc_in);
-    char line[2048];
-    if (!fgets(line, sizeof line, g_svc_out)) die("shader service exited while translating %s", variant.UTF8String);
+    FILE *sin, *sout;
+    if (quiet) { pthread_mutex_unlock(&g_rt_lock); service_spawn(&g_pf_in, &g_pf_out); sin = g_pf_in; sout = g_pf_out; }   // the prefetch translates without the lock
+    else { service_start(); sin = g_svc_in; sout = g_svc_out; }
+    fprintf(sin, "%s\n", json_string(rq).UTF8String); fflush(sin);
+    char line[2048]; int got = fgets(line, sizeof line, sout) != NULL;
+    if (quiet) pthread_mutex_lock(&g_rt_lock);
+    if (!got) { if (quiet) { pthread_mutex_unlock(&g_rt_lock); return nil; } die("shader service exited while translating %s", variant.UTF8String); }
     NSDictionary *reply = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:line length:strlen(line)] options:0 error:nil];
     if (![reply[@"ok"] boolValue]) {
+        if (quiet) { pthread_mutex_unlock(&g_rt_lock); return nil; }
         LOG("[survey-shader] frame %llu translation FAILED %s %s after %.2f ms: %s",
             (unsigned long long)dm_nvn_frame_count(), stage_name.UTF8String, variant.UTF8String,
             (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6, [[reply[@"error"] description] UTF8String]);
@@ -245,7 +261,7 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     }
     NSData *jd = [NSData dataWithContentsOfFile:[ssbu_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];
     NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
-    if (![refl isKindOfClass:[NSDictionary class]]) die("shader %s: reflection missing", variant.UTF8String);
+    if (![refl isKindOfClass:[NSDictionary class]]) { if (quiet) { pthread_mutex_unlock(&g_rt_lock); return nil; } die("shader %s: reflection missing", variant.UTF8String); }
     [vs addObject:@{@"variant": variant, @"deps": refl[@"deps"] ?: @{}}];
     [g_msl_checked addObject:variant];
     [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
@@ -276,4 +292,25 @@ void totk_rt_counts(uint64_t *fresh, int64_t *total, uint64_t *last_new_ns) {
     if (fresh) *fresh = f;
     if (total) *total = t < 0 ? -1 : t + (int64_t)(f - atomic_load(&g_new_at_count));
     if (last_new_ns) *last_new_ns = atomic_load(&g_new_variant_ns);
+}
+static _Atomic int g_rt_draw_waiting;   // draws waiting for the translator: the prefetch gives way to them
+NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local) {
+    atomic_fetch_add(&g_rt_draw_waiting, 1);
+    NSString *v = rt_variant(shader, stage, control, code, answers, local, 0);
+    atomic_fetch_sub(&g_rt_draw_waiting, 1);
+    return v;
+}
+/* SSBU shader prefetch (nvn_mtl.m mtl_prog_prefetch): translate a shader the game has just set, with the answers most draws
+   give, unless the cache already holds a variant of it (the draw then picks or makes the variant it needs). Returns the
+   variant or nil. */
+NSString *totk_rt_prefetch(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local) {
+    if (no_translator()) return nil;
+    /* A draw that needs the translator goes first (the prefetch has its own translator and holds the shared lock only to
+       look the cache up and to record a result; a first version shared one and a frame at start waited 137 s). */
+    while (atomic_load(&g_rt_draw_waiting)) usleep(1000);
+    uint32_t c1o, c1t; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4);
+    if (!c1t || c1t > 16u << 20 || c1o > c1t || (stage != 5 && c1o < 0x30) || (stage != 0 && stage != 1 && stage != 5)) return nil;
+    pthread_mutex_lock(&g_rt_lock); NSUInteger have = variants_of(shader).count; pthread_mutex_unlock(&g_rt_lock);
+    if (have) return nil;
+    return rt_variant(shader, stage, control, code, answers, local, 1);
 }

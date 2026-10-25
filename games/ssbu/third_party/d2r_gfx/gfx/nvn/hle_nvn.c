@@ -621,6 +621,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
     for (int i = 0; i < n; i++) o->sd[i].control = control_intern(o->sd[i].control);
+    { extern void mtl_prog_prefetch(const prog_t *p); mtl_prog_prefetch(o); }   // SSBU: translate while the game loads (nvn_mtl.m)
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }

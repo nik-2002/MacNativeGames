@@ -5159,6 +5159,74 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
 }
 void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
 
+/* SSBU shader prefetch: each shader is translated and its Metal library compiled when the game sets it on a program
+   (nvnProgramSetShaders, while a stage, fighter or menu loads), on a background queue, instead of at the first draw that
+   uses it. In a match on a stage new to the cache the first draws waited 9.5 s for 42 libraries, up to 3.9 s in one frame
+   (2026-10-25). The translation answers the draw-time state most draws give (float vertex attributes and outputs, 2D
+   textures: 9,159 / 629 / 1,245 of the answers recorded in the cache, the rest cube, 3D and depth textures); a draw whose
+   state differs translates the variant it needs, as before. The finished library reaches the replay through the warm-up's
+   hand-over (warm_enqueue / warm_claim). Nothing is skipped or drawn differently. SSBU_SHADER_PREFETCH=0 turns it off. */
+NSString *totk_rt_prefetch(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local);
+static NvShader *warm_shader_load(NSString *key, int stage);
+static void warm_enqueue(WarmItem *item);
+static NSDictionary *pf_answers(void) {
+    static NSDictionary *a; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableDictionary *attr = [NSMutableDictionary dictionary], *fout = [NSMutableDictionary dictionary], *tex = [NSMutableDictionary dictionary];
+        for (int i = 0; i < 16; i++) attr[@(i).stringValue] = @"float";
+        for (int i = 0; i < 8; i++) fout[@(i).stringValue] = @"float";
+        for (int i = 0; i < 128; i++) tex[@(i).stringValue] = @"2d";
+        a = @{@"tex": tex, @"img": @{}, @"attr": attr, @"fout": fout};
+    });
+    return a;
+}
+static _Atomic uint64_t g_pf_queued, g_pf_done, g_pf_ns;
+/* The work list is a stack: the newest shaders first. Smash sets about 8,300 shaders at start (nearly all it has; a
+   stage or a fighter sets few more) at about 0.28 s each, so four workers, each with its own translator, go through
+   them once (about 10 minutes the first time; the cache keeps them) and the ones set later still go first. */
+static NSMutableArray *g_pf_stack; static pthread_mutex_t g_pf_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pf_cv = PTHREAD_COND_INITIALIZER;
+static void *pf_worker(void *arg) {
+    (void)arg; pthread_setname_np("ssbu shader prefetch"); pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    for (;;) {
+        pthread_mutex_lock(&g_pf_mu);
+        while (!g_pf_stack.count) pthread_cond_wait(&g_pf_cv, &g_pf_mu);
+        void (^job)(void) = g_pf_stack.lastObject; [g_pf_stack removeLastObject];
+        pthread_mutex_unlock(&g_pf_mu);
+        @autoreleasepool { job(); }
+    }
+    return NULL;
+}
+void mtl_prog_prefetch(const prog_t *p) {
+    static int on = -1; if (on < 0) { const char *e = getenv("SSBU_SHADER_PREFETCH"); on = !(e && !strcmp(e, "0")); }
+    if (!on || !p) return;
+    static NSMutableSet<NSString *> *seen; static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSMutableSet set]; g_pf_stack = [NSMutableArray array];
+        for (int w = 0; w < 4; w++) { pthread_t t; pthread_create(&t, NULL, pf_worker, NULL); pthread_detach(t); } });
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+        const uint8_t *control = p->sd[i].control, *data = (const uint8_t *)(uintptr_t)p->sd[i].data; uint32_t length = 0, st = 0;
+        if (!control || !data) continue;
+        memcpy(&length, control + 0x704, 4); memcpy(&st, control + 0x714, 4);
+        if (!length || length > 16u << 20 || (st != 0 && st != 1 && st != 5)) continue;
+        uint8_t md[32]; CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx); CC_SHA256_Update(&ctx, control, ctl_key_len(control)); CC_SHA256_Update(&ctx, data, length); CC_SHA256_Final(md, &ctx);
+        char k[65]; for (unsigned j = 0; j < 32; j++) snprintf(k + 2 * j, 3, "%02x", md[j]);
+        NSString *key = @(k);
+        @synchronized (seen) { if ([seen containsObject:key]) continue; [seen addObject:key]; }
+        NSData *code = [NSData dataWithBytes:data length:length];   // the game may reuse the pool memory later; control is interned
+        NSArray *local = st == 5 ? rt_local(control, (int)st) : nil;
+        atomic_fetch_add(&g_pf_queued, 1);
+        void (^job)(void) = ^{
+            uint64_t t0 = bp_now();
+            NSString *v = totk_rt_prefetch(key, (int)st, control, code.bytes, pf_answers(), local);
+            NvShader *sh = v ? warm_shader_load([v stringByAppendingString:@"_b"], (int)st) : nil;
+            if (sh) { WarmItem *it = [WarmItem new]; it->kind = 0; it->key = [v stringByAppendingString:@"_b"]; it->shader = sh; warm_enqueue(it); }
+            uint64_t dt = bp_now() - t0, n = sh ? atomic_fetch_add(&g_pf_done, 1) + 1 : atomic_load(&g_pf_done), ns = atomic_fetch_add(&g_pf_ns, dt) + dt;
+            if (sh && (n <= 3 || n % 100 == 0)) MLOG("[ssbu] shader prefetch: %llu shaders translated and compiled ahead of their first draw (%llu set by the game so far), %.0f ms in the background",
+                                          (unsigned long long)n, (unsigned long long)atomic_load(&g_pf_queued), ns / 1e6);
+        };
+        pthread_mutex_lock(&g_pf_mu); [g_pf_stack addObject:job]; pthread_cond_signal(&g_pf_cv); pthread_mutex_unlock(&g_pf_mu);
+    }
+}
+
 // ---------- 描述符池：贴图号 / 采样器号 → 对象 ----------
 // 登记时快照整个贴图对象（NVN 语义：描述符已写进池）；view：该号对应的 MTLTexture（视图或基贴图，CFBridgingRetain 持有）及取得时的序号表 / 客体写代号
 // ---------- Descriptor pool: texture ID / sampler ID → object ----------
@@ -5506,6 +5574,10 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
         NSUInteger ns = base.textureType == MTLTextureType3D ? 1 : (r.v.set_layers && r.v.nlayers ? r.v.nlayers : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1) - s0);
         MTLTextureType tt = r.v.set_target ? ttype(r.v.target, base.textureType) : base.textureType;
         if (tt == MTLTextureType2D && ns > 1) ns = 1;
+        /* SSBU: a view of some faces of a cube texture with no target of its own (one face: layers min_layer+1) is a 2D view
+           of that face, or a 2D array of those faces; Metal asserts on a cube view whose slice count is not a multiple of
+           6 (2026-10-25: the process aborted after 25 minutes on the menus). */
+        if ((tt == MTLTextureTypeCube || tt == MTLTextureTypeCubeArray) && ns % 6) tt = ns == 1 ? MTLTextureType2D : MTLTextureType2DArray;
         /* TOTK containment: an invalid view must never reach the GPU (full-game runs kernel-panicked macOS; a run with
            submission disabled then hit Metal rejecting an R32Float 1-level texture viewed as BC3 sRGB with 9 levels).
            Such registrations are reported with details and bound as empty. */
@@ -6555,6 +6627,7 @@ static void warm_load_rows(NSArray<NSString *> *rows, NSMutableDictionary<NSStri
 }
 static void warm_enqueue(WarmItem *item) {
     os_unfair_lock_lock(&g_warm_lock);
+    if (!g_warm_items) g_warm_items = [NSMutableArray array];   // the shader prefetch can come before the warm-up
     [g_warm_items addObject:item];
     atomic_store_explicit(&g_warm_ready, 1, memory_order_release);
     os_unfair_lock_unlock(&g_warm_lock);
