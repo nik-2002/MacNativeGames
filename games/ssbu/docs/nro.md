@@ -1,6 +1,22 @@
 # NRO modules in Super Smash Bros. Ultimate
 
-Status: **design + extraction scaffold only.** Nothing in this file has been validated against a real SSBU dump yet.
+Status (2026-10-25): **working.** The game loads all of its `lua2cpp_*` modules through `nn::ro` and plays.
+
+## How it works now
+
+1. `make nros` (`scripts/extract_nros.py`) scans `data.arc` for `NRO0` images and the game's `.nrr` registration files and
+   writes them to `SSBU_build/extracted/v1304/nros/` and `nrrs/` (100 images on 13.0.4).
+2. `scripts/prepare_nros.py` admits only images whose SHA-256 appears in an NRR registration, wraps each one in an
+   uncompressed `NSO0` carrier, rewrites it with `third_party/d2r/patch_nso.py` (the same native rewrite as the ExeFS
+   modules), and writes `rewritten/v1304/<module>.patched.bin` plus the C catalog `nro_catalog.c` / `nro_catalog.json`.
+3. `make prepare` compiles the catalog into the runtime.
+4. At run time `runtime/nro_loader.c` answers `nn::ro`: `RegisterModuleInfo` checks the NRR, and `LoadModule` hashes the
+   guest's NRO buffer, looks it up in the catalog, and maps the verified rewritten image. Code never executes from the
+   guest's buffer. It relocates the module, resolves its imports, registers its unwind tables and runs its initializers.
+
+The loader and pipeline are adapted from the MIT `NicholasDominici/super-smash-bros-ultimate-ios` project.
+
+The sections below are the original design notes (2026-10-21), kept for background.
 
 ## Why this exists
 

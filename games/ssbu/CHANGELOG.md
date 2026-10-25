@@ -1,5 +1,75 @@
 # Super Smash Bros. Ultimate port: work log
 
+## 2026-10-25 — first boot to offline play
+
+### Boot
+
+- The scaffold boots 13.0.4 to the menus and into matches. `nn::ro` loads the 98 `lua2cpp_*` NRO modules from rewritten
+  images listed in a generated catalog (`scripts/prepare_nros.py`, `runtime/nro_loader.c`; see `docs/nro.md`).
+
+### Rendering
+
+- Matches render. Smash binds two texture pools and two sampler pools with overlapping ids. Each pool now gets its own
+  id range; before, stages and fighters drew with the dummy texture (a black or white match).
+- No crash when the game frees a texture pool on stage unload.
+- Window images start cleared, so the first frame is no longer magenta.
+- The versus screen and match intro are no longer magnified about 2x. Uniforms are read live instead of copied at submit
+  (that copy was a TotK fix; `TOTK_UBO_SNAPSHOT=1` brings it back).
+- Menu text lays out with the game's own glyphs. The glyph-lookup patch returns NULL to the 13 callers that check for
+  it, so missing glyphs get registered; only the 4 callers that don't check get the dummy glyph.
+- The NVN alpha test is emulated for every draw, with the game's reference value (`SetAlphaRef`). UI masks no longer
+  spill past their shapes.
+- A cube texture viewed as one slice is a 2D view. Metal used to abort on it after 25 minutes on the menus.
+
+### Shaders and start-up
+
+- **Shader prefetch:** each shader is translated when the game loads it (`nvnProgramSetShaders`) on four background
+  workers, each with its own translator process.
+- **Translator hang:** the translator is spawned with an empty signal mask. It had inherited a blocked `SIGCHLD` and
+  hung, which stopped all drawing.
+- **Precompiled libraries:** `scripts/prepare_shader_libs.py` compiles the translation cache into Metal libraries, which
+  the runtime loads instead of compiling.
+- **Stalls:** a match on a stage new to the cache went from 9.5 s of shader stalls to 0.66 s.
+- **Loading screen:** it shows a progress bar until every recorded pipeline is built, and the game starts after that.
+  Before, the screen went black at the first frame and the warm-up ran on 6 threads behind the intro.
+- **Background top-up:** variants no list names finish afterwards on 2 threads at utility priority.
+- **Movie pacing:** host pacing is off for Smash, which times its movies itself. Paced frames were handed over only when
+  the game presented, but its main thread waits for the first movie frame before presenting. The intro started about
+  8 s late behind a black screen, and the stall is the likely cause of a rare boot crash in `movie::Buffer::Base`.
+- **Data verification:** the record is kept per copy of the data. The app's copy and a work-folder copy shared one
+  record, so each start of the other copy re-hashed 17.6 GB (14 s before the first frame).
+
+### Input
+
+- **One player per controller:** every controller is its own Npad id and player (up to 8), with player lamps; the
+  keyboard shares player 1 with the first controller.
+- **Rumble** goes to the player the game vibrates. Before, the last controller connected got every player's rumble.
+- **Motion** comes from player 1's controller.
+- **Player-light patterns** follow the Switch (P2 = two lamps, and so on).
+- **On-screen keyboard:** the text-entry bar has one that any controller drives. A 9-key symbols row crashed the game
+  on R; it's fixed.
+
+### Content
+
+- **DLC:** `make dlc` verifies the player's add-on NSPs and writes a manifest; `nn::aoc` reports those add-ons. Smash's
+  add-ons hold only a dummy file, because the content is already in `data.arc`. Checked with 99 add-ons: Piranha Plant,
+  the Challenger Packs, stages and music unlock.
+- **Y Help:** opens the game's offline manual over the game in a WebKit view, with an `nx` stand-in for the web applet,
+  the Switch's own fonts, and a fade-in fitted to 16:9.
+- **`make manual`** merges the base manual with the update's BKTR patch (`merge_romfs.py --content html-document`) and
+  decodes the shared fonts for it.
+
+### Status
+
+Offline play works: menus, single matches with CPUs and local players, DLC fighters, sound, saves.
+
+### Open
+
+- The first appearance of a new fighter or stage still hitches once while its shaders translate.
+- The shader cache lives inside the app bundle.
+- The ZR side-menu highlight and the player-lamp icon with two controllers are unverified.
+- See `docs/port-plan.md`.
+
 ## 2026-10-21 — stage 0 scaffold
 
 - Forked `games/by3` into `games/ssbu` as the SSBU runtime base. The by3 port already had the CMIF domains, `audout:u`,

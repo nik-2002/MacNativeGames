@@ -1,9 +1,9 @@
 # SSBU native port: plan and status
 
-Status: **stage 0 scaffold.** The folder is a fork of `games/by3` with SSBU identity and a working shape, but it has not
-booted SSBU. No game data, keys, saves or NRO/NSO images are in this repository. The USB dump has been inspected
-read-only; nothing has been extracted. A separate GPL-3.0 Mac build exists (OpenSmash-Ultimate); see
-[existing-ports.md](existing-ports.md).
+Status (2026-10-25): **offline play works.** 13.0.4 boots to the menus and plays matches with correct rendering, sound,
+saves, up to eight controllers, DLC from the player's own dump, the in-game manual and controller text entry. No game data,
+keys, saves, shaders or NRO/NSO images are in this repository. A separate GPL-3.0 Mac build exists (OpenSmash-Ultimate);
+see [existing-ports.md](existing-ports.md). The history is in [../CHANGELOG.md](../CHANGELOG.md).
 
 ## Target
 
@@ -12,8 +12,8 @@ read-only; nothing has been extracted. A separate GPL-3.0 Mac build exists (Open
 - Native ARM64 execution on Apple silicon, using the MacNativeGames rewriter/Horizon host/NVN-on-Metal approach. This is
   not static recompilation.
 - First milestone: offline local play (versus/CPU) with picture, sound, keyboard/controller input and saves.
-- Out of scope for the first port: online/NPLN, amiibo/NFP, GameCube adapter (WUP-028), DLC entitlement checks beyond
-  making the update's own data usable.
+- Out of scope for the first port: online/NPLN, amiibo/NFP, GameCube adapter (WUP-028). DLC is supported from the
+  player's own add-on NSPs (`make dlc`).
 
 ## Why by3 is the base
 
@@ -62,67 +62,54 @@ Read-only inspection of the player's dump on an external drive. Nothing was extr
 
 ## Pipeline
 
-```sh
-# 1. Code and RomFS (local work folder)
-python3 scripts/extract_code.py "<update>.nsp" --keys prod.keys \
-  --output SSBU_build/extracted/v1304/exefs
-python3 scripts/merge_romfs.py "<base>.nsp" "<update>.nsp" --keys prod.keys \
-  --output SSBU_build/extracted/v1304/romfs
+The full command list is in the [README](../README.md#build). In short: extract the ExeFS code, merge the base and update
+RomFS (the base is a plain NCA, the update a BKTR patch; `merge_romfs.py` handles both), extract the shared fonts, rewrite
+the three ExeFS modules, extract and rewrite the 98 NRO modules (`make nros`, `prepare_nros.py`), pin the dump's hashes,
+`make prepare runtime shader-tools`, then optionally `make dlc` and `make manual`, and `make app`. After a session that met
+new shaders, `scripts/prepare_shader_libs.py` compiles them into Metal libraries.
 
-# 2. Rewrite the three ExeFS modules (inherited by3 pipeline; validate the SSBU layout first)
-for m in sdk subsdk0 main; do
-  DM_RULESET=native DM_PRIVATE_GATES=0 python3 third_party/d2r/patch_nso.py \
-    SSBU_build/extracted/v1304/exefs/$m SSBU_build/rewritten/v1304 $m
-done
-python3 scripts/prepare_modules.py SSBU_build/extracted/v1304/exefs \
-  --output SSBU_build/extracted/v1304/elf
-
-# 3. Pin the local hashes, then generate runtime tables
-python3 scripts/make_expected.py --work SSBU_build \
-  --output SSBU_build/expected-v13.0.4.json
-make prepare EXPECTED=SSBU_build/expected-v13.0.4.json
-
-# 4. Build the host (needs the generated headers from step 3)
-make runtime
-make app GAME="<update>.nsp" KEYS=prod.keys
-```
-
-`make nros` runs the experimental `data.arc` scan; it is the start of the NRO milestone, not a working loader.
+All of it runs on the internal disk; copy inputs off external drives first (workspace `AGENTS.md`).
 
 ## Runtime architecture
 
 - `runtime/loader.c`: maps and relocates the ExeFS modules from `rewritten/v1304`.
-- `runtime/services.c`: dispatches host overrides and SVCs.
-- `runtime/system_services.c`: inherited by3 service answers; SSBU's service survey is TODO.
-- `runtime/romfs.c`: read-only RomFS backed by the verified merged image.
-- `runtime/game_patches.c`: generic patch-table applier; no SSBU patch set yet.
-- `third_party/d2r_gfx`: NVN-on-Metal layer; inherited, with by3-specific paths unverified for SSBU.
-- `runtime/nro_loader.c`: NRO boundary stub; see [nro.md](nro.md).
+- `runtime/nro_loader.c`: `nn::ro`; maps the rewritten `lua2cpp_*` modules from the generated catalog ([nro.md](nro.md)).
+- `runtime/services.c`, `runtime/system_services.c`: host overrides and SVCs; `nn::aoc` reports the DLC manifest;
+  `nn::web::ShowOfflineHtmlPage` opens the manual.
+- `runtime/romfs.c`: read-only RomFS backed by the verified merged image (verification record per image).
+- `runtime/input.c`, `runtime/gamepad.m`, `runtime/hid_feedback.c`, `runtime/gamepad_feedback.m`: keyboard and
+  per-player controllers, rumble, motion, player lamps.
+- `runtime/frontend.m`: window, loading screen, text-entry bar with on-screen keyboard, manual page view.
+- `runtime/movie_host.c`: VP9 movies through libvpx (no host pacing for Smash).
+- `runtime/game_patches.c`: SSBU code patches (glyph lookup).
+- `third_party/d2r_gfx`: NVN-on-Metal (per-pool texture and sampler ids, alpha-test emulation, shader prefetch,
+  precompiled libraries, start-up warm-up).
 
-## Known blockers, in order
+## Open problems
 
-1. **NRO pipeline.** 98 `lua2cpp_*` modules in `data.arc`; extraction, rewrite, sidecar and `nn::ro` shim are not done.
-2. **First boot.** The SSBU `main`/`sdk`/`subsdk0` layout must satisfy the inherited `prepare_runtime.py` assumptions
-   (three modules, symbol/relocation tables, `DT_INIT` shape, PLT probe).
-3. **Service survey.** Follow every unimplemented service/NVN call from the first boot. by3's answers are a starting
-   point, not a specification.
-4. **Shader pipeline.** No SSBU shader seed/cache; expect stutter and missing translations until the inventory is built.
-5. **Input latency and mapping.** SSBU's two-player/local expectations, controller layout and 60 Hz pacing need direct
-   measurement.
-6. **Audio.** SSBU uses Opus; the inherited `audout:u`/Wwise path may be unused, and the Opus decoder path needs testing.
-7. **RomFS layout.** Validate that the by3 sparse-base/BKTR merge matches SSBU's base and update; do not repack `data.arc`.
-8. **Disk budget.** The internal volume has about 35 GiB free; the NSPs, merged RomFS and build artifacts do not fit
-   comfortably. Free internal space is required before a full extraction/build; external volumes are cold storage only.
+1. **First appearance of new shaders.** A fighter or stage met for the first time hitches once (1.5–3 s in total) while its
+   shaders translate; `prepare_shader_libs.py` afterwards makes it smooth. A shader inventory built from `data.arc` ahead
+   of play would remove the first hitch.
+2. **Shader cache inside the app bundle.** The bundled game folder holds the translation cache and libraries, so play
+   writes into the signed bundle. Move them to Application Support.
+3. **Start-up time.** The loading screen waits 2.5–9.5 s for about 7,000 pipelines; loading 14,000 separate libraries
+   dominates. A Metal binary archive could cut it.
+4. **Rare boot crash** in `movie::Buffer::Base` (`subsdk0+0x23b40`), seen once before the movie-pacing fix; not seen since.
+5. **Unverified:** the ZR side-menu highlight, a white wedge on the Smash submenu, the player-lamp icon with two
+   controllers, and on-screen keyboard navigation on every controller type.
+6. **Out of scope:** online play, amiibo, the GameCube adapter, 13.0.5.
+
+Testing note: an agent's test window starts unfocused, and macOS then keeps the game on the efficiency cores. Frame times
+from such runs are not representative; use a run from the player's own foreground window
+(`~/Library/Logs/MacNativeGames/ssbu.log`).
 
 ## Milestones
 
-- **M0 (this tree):** scaffold, identity, docs, hash template, NRO scanner, loud NRO stub.
-- **M1:** extract and rewrite the three ExeFS modules; `make prepare` + `make runtime` succeed against a local dump.
-- **M2:** first boot to `nnMain`, then to the first `nn::ro::LoadModule`.
-- **M3:** load one `lua2cpp_*` sidecar and call a known export.
-- **M4:** title/menu with picture and sound.
-- **M5:** offline versus/CPU match; input, saves, 60 Hz pacing.
-- **Later:** 13.0.5, more modes, performance, optional online/amiibo/GameCube adapter work.
+- **M0 (2026-10-21):** scaffold, identity, docs, hash template, NRO scanner.
+- **M1–M3 (2026-10-25):** ExeFS rewrite, `make prepare` / `make runtime`, first boot, NRO modules loaded.
+- **M4 (2026-10-25):** title and menus with picture and sound, correct text and UI masks.
+- **M5 (2026-10-25):** offline matches; multiple controllers, saves, 60 Hz, DLC, manual, text entry.
+- **Next:** shader inventory ahead of play, cache out of the bundle, faster start, then 13.0.5.
 
 ## Licensing and provenance
 
