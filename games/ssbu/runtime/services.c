@@ -206,10 +206,31 @@ void runtime_guest_resident(uint64_t *resident,uint64_t *dirty,uint64_t *compres
 }
 static void host_diag_init(void) { fprintf(stderr,"[ssbu] native diagnostics initialized\n"); }
 static void host_oe_init(void) { fprintf(stderr,"[ssbu] application environment: local macOS process\n"); }
-static void host_aoc_init(void) { fprintf(stderr,"[ssbu] add-on content: no DLC\n"); }
-static int host_aoc_count(void) { return 0; }
+/* Add-on content (DLC): the add-ons dlc/manifest.json lists (scripts/extract_dlc.py, from the player's own NSPs). Smash's
+   add-ons hold only a dummy file; the fighters, stages and music are in data.arc and the game unlocks them from the
+   owned add-on indices it counts and lists here (main imports only CountAddOnContent and ListAddOnContent, it mounts
+   nothing). SSBU_DLC=0: no add-ons. */
+static int aocIndex[0x1000],aocCount=-1;
+static int aoc_cmp(const void *a,const void *b){return *(const int *)a-*(const int *)b;}
+static void aoc_load(void){
+ if(aocCount>=0)return;aocCount=0;
+ const char *e=getenv("SSBU_DLC");if(e&&!strcmp(e,"0")){fprintf(stderr,"[ssbu] add-on content: off (SSBU_DLC=0)\n");return;}
+ FILE *f=fopen("dlc/manifest.json","rb");if(!f){fprintf(stderr,"[ssbu] add-on content: none (no dlc/manifest.json; make dlc)\n");return;}
+ static char text[1<<20];size_t n=fread(text,1,sizeof text-1,f);int whole=feof(f);fclose(f);if(!whole)runtime_fail("dlc/manifest.json too large");text[n]=0;
+ for(const char *p=text;(p=strstr(p,"\"index\":"));){
+  char *end;long v=strtol(p+8,&end,10);if(end==p+8||v<=0||v>=0x1000)runtime_fail("dlc/manifest.json: invalid add-on index");
+  for(int i=0;i<aocCount;i++)if(aocIndex[i]==v)runtime_fail("dlc/manifest.json: duplicate add-on index");
+  aocIndex[aocCount++]=(int)v;p=end;}
+ qsort(aocIndex,(size_t)aocCount,sizeof *aocIndex,aoc_cmp);
+ fprintf(stderr,"[ssbu] add-on content: %d add-ons (dlc/manifest.json)\n",aocCount);
+}
+static void host_aoc_init(void) { aoc_load(); }
+static int host_aoc_count(void) { aoc_load(); return aocCount; }
 static int host_aoc_list(int *out,int offset,int count) {
- (void)out;if(offset<0||count<0)runtime_fail("invalid add-on content list range");return 0;
+ if(offset<0||count<0||(count&&!out))runtime_fail("invalid add-on content list range");aoc_load();
+ int n=0;for(int i=offset;i<aocCount&&n<count;i++)out[n++]=aocIndex[i];
+ static int logged;if(!logged++)fprintf(stderr,"[ssbu] add-on content: game lists %d from %d (of %d)\n",n,offset,aocCount);
+ return n;
 }
 static void host_error_init(void) { fprintf(stderr,"[ssbu] error contexts: local diagnostics\n"); }
 static void host_fs_init(void) { runtime_fs_init(); }

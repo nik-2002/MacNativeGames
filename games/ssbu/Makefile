@@ -74,7 +74,7 @@ boot: runtime
 
 # The player's mods, made into checked tables: exefs patches (mods/13.0.4/<name>/exefs/*.pchtxt) -> <work>/patches,
 # RomFS mods (mods/<name>/romfs/...) -> their manifest.tsv (sizes and SHA-256 of the replacements and the originals).
-.PHONY: patches mods nros app
+.PHONY: patches mods nros dlc app
 patches:
 	"$(PY)" scripts/prepare_patches.py --work "$(WORK)" --expected "$(EXPECTED)"
 mods:
@@ -85,6 +85,13 @@ mods:
 NROS ?= $(WORK)/extracted/v1304/nros
 nros:
 	"$(PY)" scripts/extract_nros.py "$(WORK)/extracted/v1304/romfs/data.arc" --output "$(NROS)"
+
+# Add-on content (DLC) from the player's own NSPs: DLC=<folder of add-on NSPs, copied to the internal disk> KEYS=<prod.keys>.
+# Writes <work>/dlc/<title id>/ and <work>/dlc/manifest.json, which the runtime reads (nn::aoc, runtime/services.c).
+DLC ?=
+dlc:
+	@[ -n "$(DLC)" ] && [ -n "$(KEYS)" ] || { echo "make dlc DLC=<folder of add-on NSPs> KEYS=<prod.keys>"; exit 1; }
+	"$(PY)" scripts/extract_dlc.py --keys "$(KEYS)" --input "$(DLC)" --output "$(WORK)/dlc"
 
 # The app: a small launcher bundle (settings window with presets, then the game) that runs the game from the work
 # folder, which it names in Info.plist (SSBUWorkFolder): nothing large is copied. Its icon comes from the game's own
