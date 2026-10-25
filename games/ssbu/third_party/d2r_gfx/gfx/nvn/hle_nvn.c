@@ -1761,7 +1761,9 @@ NVN(nvnCommandBufferSetScissors, void, NVNcommandBuffer *c, int first, int n, co
     if (first < 0 || n < 0 || first + n > 16) die("SetScissors first=%d n=%d", first, n);
     for (int i = 1; i < n; i++) if (memcmp(r + 4 * i, r, 16)) {
         static int once;
-        if (!once++) LOG("【红】SetScissors: differing scissor %d ignored (single-scissor replay): sc0=[%d,%d,%d,%d] sc%d=[%d,%d,%d,%d]",
+        /* SSBU sets two scissors once at start (left / right half of 1280x720: the Labo VR stereo layout); none of its
+           shaders selects a viewport index (2026-10-26, 15,447 translated shaders), so only scissor 0 is ever used. */
+        if (!once++) LOG("SetScissors: scissor %d differs and is unused unless a shader selects a viewport index: sc0=[%d,%d,%d,%d] sc%d=[%d,%d,%d,%d]",
                          first + i, r[0], r[1], r[2], r[3], first + i, r[4*i], r[4*i+1], r[4*i+2], r[4*i+3]);
     }
     int best = 0;

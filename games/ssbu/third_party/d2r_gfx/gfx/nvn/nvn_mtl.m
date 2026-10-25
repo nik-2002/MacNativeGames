@@ -10764,6 +10764,92 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     defer_obj_unref(sv); defer_obj_unref(dv); defer_obj_release(pb);   // 本次提交跑完再放（视图不单独驻留，参数块撤驻留） | Release after this submit has finished running (views are not made resident separately; the parameter block is removed from residency)
     return 1;
 }
+/* SSBU: texture -> texture copies that change size, mirror or format, which a blit cannot do. Smash halves its
+   1920x1080 depth-stencil buffer to 960x540 during play (2026-10-25, NVN 2D engine, no filter) for its half-resolution
+   effects; the copy was skipped, so those effects were tested against a stale depth buffer. A render pass over the
+   destination region draws one triangle: colour targets sample the source (linear when the game asks for the filter,
+   mirrored when it asks), depth targets write the source depth of the nearest texel ([[depth(any)]]); the stencil of a
+   depth-stencil destination is kept. 2D and array layers only; integer colour formats are not handled (returns 0). */
+static const char k_t2t_msl[] =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"struct P { float4 src; float4 dst; uint4 f; };\n"   /* src / dst: x, y, w, h in texels; f: mirror x, mirror y, linear */
+"struct V { float4 p [[position]]; };\n"
+"vertex V vs(uint id [[vertex_id]]) { float2 q = float2((id << 1) & 2, id & 2); V o; o.p = float4(q * 2 - 1, 0, 1); return o; }\n"
+"static float2 at(float4 fc, constant P& p) { float2 t = (fc.xy - p.dst.xy) / p.dst.zw; if (p.f.x) t.x = 1 - t.x; if (p.f.y) t.y = 1 - t.y; return p.src.xy + t * p.src.zw; }\n"
+"fragment float4 fc(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant P& p [[buffer(0)]]) {\n"
+"  float2 a = at(in.p, p); float2 n = float2(t.get_width(), t.get_height());\n"
+"  if (p.f.z) return t.sample(s, a / n); return t.read(uint2(clamp(a, float2(0), n - 1))); }\n"
+"struct D { float d [[depth(any)]]; };\n"
+"fragment D fd(V in [[stage_in]], depth2d<float> t [[texture(0)]], constant P& p [[buffer(0)]]) {\n"
+"  float2 a = at(in.p, p); float2 n = float2(t.get_width(), t.get_height()); D o; o.d = t.read(uint2(clamp(a, float2(0), n - 1))); return o; }\n";
+static int pf_is_int(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+    case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
+    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: return 1;
+    default: return 0;
+    }
+}
+static int pf_is_depth(MTLPixelFormat f) { return f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float_Stencil8; }
+static int copy_t2t_scaled(const p_copy_t2t *c, id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned ss, unsigned dl, unsigned ds) {
+    static id<MTLLibrary> lib; static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *pso; static id<MTL4ArgumentTable> at;
+    static id<MTLSamplerState> lin; static id<MTLDepthStencilState> dss_depth, dss_none; static int failed;
+    if (failed || !(d.usage & MTLTextureUsageRenderTarget)) return 0;
+    int depth = pf_is_depth(d.pixelFormat);
+    if (depth != pf_is_depth(s.pixelFormat)) return 0;
+    if (!depth && (fmt_compressed(c->dst->d.format) || pf_is_int(d.pixelFormat) || pf_is_int(s.pixelFormat))) return 0;
+    NSError *e = nil;
+    if (!lib) {
+        lib = [g_dev newLibraryWithSource:@(k_t2t_msl) options:nil error:&e];
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; ad.maxSamplerStateBindCount = 1; ad.maxBufferBindCount = 1;
+        at = lib ? [g_dev newArgumentTableWithDescriptor:ad error:&e] : nil;
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge; sd.supportArgumentBuffers = YES; lin = [g_dev newSamplerStateWithDescriptor:sd];
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
+        dss_depth = [g_dev newDepthStencilStateWithDescriptor:dd]; dss_none = [g_dev newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
+        pso = [NSMutableDictionary dictionary];
+        if (!lib || !at || !lin) { failed = 1; MLOG("【红】缩放贴图拷贝的着色器 / 参数表建不出：%s", e.localizedDescription.UTF8String); return 0; }
+    }
+    id<MTLRenderPipelineState> ps = pso[@(d.pixelFormat)];
+    if (!ps) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+        pd.fragmentFunction = [lib newFunctionWithName:depth ? @"fd" : @"fc"];
+        if (depth) { pd.depthAttachmentPixelFormat = d.pixelFormat; if (d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) pd.stencilAttachmentPixelFormat = d.pixelFormat; }
+        else pd.colorAttachments[0].pixelFormat = d.pixelFormat;
+        ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!ps) { RED_ONCE(64, "缩放贴图拷贝的管线建不出（格式 %lu）：%s", (unsigned long)d.pixelFormat, e.localizedDescription.UTF8String); return 0; }
+        pso[@(d.pixelFormat)] = ps;
+    }
+    id<MTLTexture> sv = [s newTextureViewWithPixelFormat:s.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss, 1)];
+    id<MTLBuffer> pb = [g_dev newBufferWithLength:48 options:MTLResourceStorageModeShared];
+    if (!sv || !pb) return 0;
+    float *f = pb.contents; f[0] = c->sr.xoffset; f[1] = c->sr.yoffset; f[2] = c->sr.width; f[3] = c->sr.height;
+    f[4] = c->dr.xoffset; f[5] = c->dr.yoffset; f[6] = c->dr.width; f[7] = c->dr.height;
+    uint32_t *u = (uint32_t *)(f + 8); u[0] = !!(c->flags & NVN_COPY_FLAGS_MIRROR_X_BIT); u[1] = !!(c->flags & NVN_COPY_FLAGS_MIRROR_Y_BIT); u[2] = !depth && (c->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT); u[3] = 0;
+    res_add(pb);
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    MTLRenderPassAttachmentDescriptor *a = depth ? rp.depthAttachment : rp.colorAttachments[0];
+    a.texture = d; a.level = dl; a.slice = ds; a.loadAction = MTLLoadActionLoad; a.storeAction = MTLStoreActionStore;
+    if (d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) { rp.stencilAttachment.texture = d; rp.stencilAttachment.level = dl; rp.stencilAttachment.slice = ds;
+        rp.stencilAttachment.loadAction = MTLLoadActionLoad; rp.stencilAttachment.storeAction = MTLStoreActionStore; }
+    rp_end(); blit_close(); rs_sync(); pt_mark(g_cb, 'R', rp);
+    id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; es_reset();
+    if (!en) { defer_obj_release(pb); defer_obj_unref(sv); return 0; }
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    [en setArgumentTable:at atStages:MTLRenderStageFragment];
+    [at setTexture:sv.gpuResourceID atIndex:0]; [at setSamplerState:lin.gpuResourceID atIndex:0]; [at setAddress:pb.gpuAddress atIndex:0];
+    [en setViewport:(MTLViewport){c->dr.xoffset, c->dr.yoffset, c->dr.width, c->dr.height, 0, 1}];
+    [en setScissorRect:(MTLScissorRect){(NSUInteger)c->dr.xoffset, (NSUInteger)c->dr.yoffset, (NSUInteger)c->dr.width, (NSUInteger)c->dr.height}];
+    [en setRenderPipelineState:ps]; [en setDepthStencilState:depth ? dss_depth : dss_none];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
+    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    defer_obj_unref(sv); defer_obj_release(pb);
+    static int said; if (!said++) MLOG("缩放贴图拷贝（渲染通道）：%dx%d → %dx%d 格式 %lu → %lu 标志 %#x", c->sr.width, c->sr.height, c->dr.width, c->dr.height,
+                                      (unsigned long)s.pixelFormat, (unsigned long)d.pixelFormat, c->flags);
+    return 1;
+}
 // GPU：贴图 → 贴图（原先误列为空操作，选角页每帧 3 次）。等尺寸、不镜像、同格式 → 逐层 blit；其余语义（缩放带过滤、镜像、换格式）blit 表达不了，报红待实现
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
@@ -10792,6 +10878,11 @@ static void copy_t2t(const p_copy_t2t *c) {
     }
     if (c->sr.width != c->dr.width || c->sr.height != c->dr.height || (c->sr.depth ? c->sr.depth : 1) != (c->dr.depth ? c->dr.depth : 1) || (c->flags & ~NVN_COPY_FLAGS_ENGINE_2D_BIT & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT)
         || s.pixelFormat != d.pixelFormat || s3 != d3) {
+        if (!s3 && !d3 && (c->dr.depth ? c->dr.depth : 1) == nz && c->sr.width > 0 && c->sr.height > 0 && c->dr.width > 0 && c->dr.height > 0) {
+            int ok = 1;
+            for (int z = 0; z < nz && ok; z++) ok = copy_t2t_scaled(c, s, d, sl, sz0 + c->sr.zoffset + z, dl, dz0 + c->dr.zoffset + z);
+            if (ok) return;
+        }
         RED_ONCE(33, "贴图→贴图拷贝未实现的形态：%dx%dx%d→%dx%dx%d 标志 %#x 格式 %lu→%lu 3D %d→%d", c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth,
                  c->flags, (unsigned long)s.pixelFormat, (unsigned long)d.pixelFormat, s3, d3);
         return;
@@ -12932,6 +13023,65 @@ int mtl_probe_blockrt(void) {
         checked += (int)(3 * size);
         for (id o in @[bc, aux, aux2, ref, rb1, rb2, rb3]) defer_obj_release(o);
     }
+    return checked;
+}
+/* SSBU: copy_t2t_scaled on known data. A 64x32 depth texture (value = texel index / 4096) and a 64x32 RGBA8 texture
+   (r = 4x, g = 8y) are halved to 32x16: depth and colour nearest read texel (2x+1, 2y+1); colour with the linear filter
+   averages the four texels around that point; mirrored in x reads texel (63-2x, 2y+1). Every pixel is compared. */
+int mtl_probe_scaled_copy(void) {
+    mtl_init();
+    const int SW = 64, SH = 32, DW = 32, DH = 16;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:SW height:SH mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> ds = [g_dev newTextureWithDescriptor:td]; td.width = DW; td.height = DH; id<MTLTexture> dd = [g_dev newTextureWithDescriptor:td];
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm; td.width = SW; td.height = SH; id<MTLTexture> cs = [g_dev newTextureWithDescriptor:td];
+    td.width = DW; td.height = DH; id<MTLTexture> cd[3]; for (int i = 0; i < 3; i++) cd[i] = [g_dev newTextureWithDescriptor:td];
+    for (id<MTLTexture> t in @[ds, dd, cs, cd[0], cd[1], cd[2]]) { if (!t) MDIE("scaled copy probe texture"); res_add(t); }
+    id<MTLBuffer> dsrc = probe_buf(SW * SH * 4), csrc = probe_buf(SW * SH * 4), dread = probe_buf(DW * DH * 4), cread[3];
+    for (int i = 0; i < 3; i++) cread[i] = probe_buf(DW * DH * 4);
+    float *dp = dsrc.contents; uint8_t *cp = csrc.contents;
+    for (int y = 0; y < SH; y++) for (int x = 0; x < SW; x++) { dp[y * SW + x] = (float)(y * SW + x) / 4096.f; uint8_t *q = cp + 4 * (y * SW + x); q[0] = (uint8_t)(4 * x); q[1] = (uint8_t)(8 * y); q[2] = 0; q[3] = 255; }
+    tex_t dst = {0}; dst.d.format = 0x25;   /* any uncompressed format code: only checked for compression */
+    p_copy_t2t c = {0}; c.dst = &dst; c.sr.width = SW; c.sr.height = SH; c.sr.depth = 1; c.dr.width = DW; c.dr.height = DH; c.dr.depth = 1;
+    mtl_sub_begin();
+    enc_b_copy_buffer_texture(blit(), dsrc, 0, SW * 4, SW * SH * 4, MTLSizeMake(SW, SH, 1), ds, 0, 0, MTLOriginMake(0, 0, 0));
+    enc_b_copy_buffer_texture(blit(), csrc, 0, SW * 4, SW * SH * 4, MTLSizeMake(SW, SH, 1), cs, 0, 0, MTLOriginMake(0, 0, 0));
+    if (!copy_t2t_scaled(&c, ds, dd, 0, 0, 0, 0)) MDIE("scaled copy probe: depth copy refused");
+    if (!copy_t2t_scaled(&c, cs, cd[0], 0, 0, 0, 0)) MDIE("scaled copy probe: colour copy refused");
+    c.flags = NVN_COPY_FLAGS_LINEAR_FILTER_BIT; if (!copy_t2t_scaled(&c, cs, cd[1], 0, 0, 0, 0)) MDIE("scaled copy probe: linear copy refused");
+    c.flags = NVN_COPY_FLAGS_MIRROR_X_BIT; if (!copy_t2t_scaled(&c, cs, cd[2], 0, 0, 0, 0)) MDIE("scaled copy probe: mirrored copy refused");
+    enc_b_copy_texture_buffer(blit(), dd, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(DW, DH, 1), dread, 0, DW * 4, DW * DH * 4);
+    for (int i = 0; i < 3; i++) enc_b_copy_texture_buffer(blit(), cd[i], 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(DW, DH, 1), cread[i], 0, DW * 4, DW * DH * 4);
+    mtl_sub_commit(); mtl_finish();
+    int checked = 0;
+    for (int y = 0; y < DH; y++) for (int x = 0; x < DW; x++) {
+        int sx = 2 * x + 1, sy = 2 * y + 1, i = y * DW + x;
+        if (((const float *)dread.contents)[i] != dp[sy * SW + sx]) MDIE("scaled copy probe: depth pixel %d,%d = %g, want %g", x, y, ((const float *)dread.contents)[i], dp[sy * SW + sx]);
+        const uint8_t *n = (const uint8_t *)cread[0].contents + 4 * i, *l = (const uint8_t *)cread[1].contents + 4 * i, *m = (const uint8_t *)cread[2].contents + 4 * i;
+        if (n[0] != 4 * sx || n[1] != 8 * sy) MDIE("scaled copy probe: nearest pixel %d,%d = %u,%u, want %u,%u", x, y, n[0], n[1], 4 * sx, 8 * sy);
+        if (abs((int)l[0] - (4 * sx - 2)) > 1 || abs((int)l[1] - (8 * sy - 4)) > 1) MDIE("scaled copy probe: linear pixel %d,%d = %u,%u, want about %d,%d", x, y, l[0], l[1], 4 * sx - 2, 8 * sy - 4);
+        if (m[0] != 4 * (SW - 1 - 2 * x) || m[1] != 8 * sy) MDIE("scaled copy probe: mirrored pixel %d,%d = %u,%u, want %u,%u", x, y, m[0], m[1], 4 * (SW - 1 - 2 * x), 8 * sy);
+        checked += 4;
+    }
+    /* The format Smash uses (depth 32 + stencil 8): the source is cleared to depth 0.25, the destination to 1.0; the copy
+       must carry the depth (read back as the depth plane) with the stencil attachment kept. */
+    td.pixelFormat = MTLPixelFormatDepth32Float_Stencil8; td.width = SW; td.height = SH; td.usage |= MTLTextureUsagePixelFormatView;
+    id<MTLTexture> zs = [g_dev newTextureWithDescriptor:td]; td.width = DW; td.height = DH; id<MTLTexture> zd = [g_dev newTextureWithDescriptor:td];
+    if (!zs || !zd) MDIE("scaled copy probe: depth-stencil textures"); res_add(zs); res_add(zd);
+    mtl_sub_begin();
+    for (int i = 0; i < 2; i++) {
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; id<MTLTexture> t = i ? zd : zs;
+        rp.depthAttachment.texture = t; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = i ? 1.0 : 0.25;
+        rp.stencilAttachment.texture = t; rp.stencilAttachment.loadAction = MTLLoadActionClear; rp.stencilAttachment.storeAction = MTLStoreActionStore; rp.stencilAttachment.clearStencil = i ? 3 : 7;
+        enc_r_end(enc_r_begin(rp));
+    }
+    c.flags = 0; if (!copy_t2t_scaled(&c, zs, zd, 0, 0, 0, 0)) MDIE("scaled copy probe: depth-stencil copy refused");
+    id<MTLBuffer> zr = probe_buf(DW * DH * 4);
+    [blit() copyFromTexture:zd sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(DW, DH, 1)
+                   toBuffer:zr destinationOffset:0 destinationBytesPerRow:DW * 4 destinationBytesPerImage:DW * DH * 4 options:MTLBlitOptionDepthFromDepthStencil];
+    mtl_sub_commit(); mtl_finish();
+    for (int i = 0; i < DW * DH; i++, checked++) if (((const float *)zr.contents)[i] != 0.25f) MDIE("scaled copy probe: depth-stencil depth %d = %g, want 0.25", i, ((const float *)zr.contents)[i]);
+    for (id r in @[ds, dd, cs, cd[0], cd[1], cd[2], dsrc, csrc, dread, cread[0], cread[1], cread[2], zs, zd, zr]) defer_obj_release(r);
     return checked;
 }
 /* Exercise the production descriptor with the same fragment shader, with and without a depth attachment. */
