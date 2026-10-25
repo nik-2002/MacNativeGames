@@ -10,16 +10,23 @@
 #include "controller_map.h"   // the player's button layout (controls.txt)
 
 static pthread_mutex_t gamepadLock = PTHREAD_MUTEX_INITIALIZER;
-static RuntimeGamepadState gamepadState;
-static uint64_t pressedEdges;
 static BOOL started;
 static uint16_t controllerMap[CONTROLLER_BUTTONS];
 static uint8_t controllerModes[CONTROLLER_BUTTONS];
-static uint64_t physicalPrev;
-static uint64_t tapUntil[CONTROLLER_BUTTONS];   /* ns, for tap */
-static int toggleOn[CONTROLLER_BUTTONS];        /* for toggle */
-static int toggleMoved[CONTROLLER_BUTTONS];     /* the stick moved since the toggle went on */
-static void refresh_gamepads(void);
+/* Each controller is its own player: slot s is Npad id s (player s + 1), the lowest free slot when it connects, and
+   keeps it until it goes away. SSBU_MERGE_PADS=1: every controller is slot 0, OR-ed together (one player). */
+typedef struct {
+    RuntimeGamepadState state;
+    uint64_t pressedEdges;
+    uint64_t physicalPrev;
+    uint64_t tapUntil[CONTROLLER_BUTTONS];   /* ns, for tap */
+    int toggleOn[CONTROLLER_BUTTONS];        /* for toggle */
+    int toggleMoved[CONTROLLER_BUTTONS];     /* the stick moved since the toggle went on */
+} PadSlot;
+static PadSlot slots[RUNTIME_GAMEPAD_SLOTS];             /* state: gamepadLock; the mode state: main queue */
+static __weak GCController *slotOwner[RUNTIME_GAMEPAD_SLOTS];   /* main queue */
+static int mergePads;
+static void refresh_slot(int slot);
 
 /* The player's button layout (controller_map.h): TOTK_CONTROLS names the file (the launcher: <data>/controls.txt and
    checks it first). No file: the default layout. */
@@ -76,12 +83,19 @@ static uint64_t gamepad_buttons(GCExtendedGamepad *pad, int by_position) {
     return buttons;
 }
 
-static void refresh_gamepads(void) {
+static int slot_of(GCController *controller) {
+    if (mergePads) return 0;
+    for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS; i++) if (slotOwner[i] == controller) return i;
+    return -1;
+}
+
+static void refresh_slot(int slot) {
+    PadSlot *p = &slots[slot];
     RuntimeGamepadState next = {0};
     uint64_t physical = 0;
     for (GCController *controller in GCController.controllers) {
         GCExtendedGamepad *pad = controller.extendedGamepad;
-        if (!pad) continue;
+        if (!pad || slot_of(controller) != slot) continue;
         next.connected = 1;
         physical |= gamepad_buttons(pad, face_by_position(controller));
         next.lx = stronger_axis(next.lx, stick_axis(pad.leftThumbstick.xAxis.value));
@@ -91,23 +105,23 @@ static void refresh_gamepads(void) {
     }
     /* Modes work on the physical buttons, not on the mapped ones: two physical buttons may share a Switch button
        (X and L3 both running), and a mapped edge would be lost while the other one is held. */
-    uint64_t now = runtime_now_ns(), edges = physical & ~physicalPrev, synthetic = 0, suppressed = 0;
+    uint64_t now = runtime_now_ns(), edges = physical & ~p->physicalPrev, synthetic = 0, suppressed = 0;
     int moving = next.lx || next.ly;
-    physicalPrev = physical;
+    p->physicalPrev = physical;
     for (int i = 0; i < CONTROLLER_BUTTONS; i++) {
         uint64_t bit = 1ULL << i;
         int kind = controller_mode_kind(controllerModes[i]);
         if (kind == CONTROLLER_TAP && (edges & bit)) {
-            tapUntil[i] = now + 400000000ULL;
+            p->tapUntil[i] = now + 400000000ULL;
             /* Release the pulse even if the controller sends no further event. */
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{ refresh_gamepads(); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{ refresh_slot(slot); });
         }
         if (kind == CONTROLLER_TOGGLE) {
-            if (edges & bit) { toggleOn[i] = !toggleOn[i]; toggleMoved[i] = moving; }
-            if (toggleOn[i] && moving) toggleMoved[i] = 1;
+            if (edges & bit) { p->toggleOn[i] = !p->toggleOn[i]; p->toggleMoved[i] = moving; }
+            if (p->toggleOn[i] && moving) p->toggleMoved[i] = 1;
             /* A toggle ends when the stick returns to center after moving, or the controller goes away; clicking at rest
                waits for the first move, and attacking while running does not stop it. */
-            if (toggleOn[i] && ((toggleMoved[i] && !moving) || !next.connected)) toggleOn[i] = 0;
+            if (p->toggleOn[i] && ((p->toggleMoved[i] && !moving) || !next.connected)) p->toggleOn[i] = 0;
         }
         if (kind == CONTROLLER_AIM && (physical & bit)) {
             /* Aim: the Switch button is held while drawing, released while the fire button is down (the shot), and its
@@ -116,60 +130,85 @@ static void refresh_gamepads(void) {
             suppressed |= fire;
             if (!(physical & fire)) synthetic |= controllerMap[i];
         }
-        int active = kind == CONTROLLER_TAP ? now < tapUntil[i] : kind == CONTROLLER_TOGGLE ? toggleOn[i] : 0;
+        int active = kind == CONTROLLER_TAP ? now < p->tapUntil[i] : kind == CONTROLLER_TOGGLE ? p->toggleOn[i] : 0;
         if (active) synthetic |= controllerMap[i];
     }
     uint64_t held = physical & ~suppressed;
     for (int i = 0; i < CONTROLLER_BUTTONS; i++) if (controllerModes[i] != CONTROLLER_HOLD) held &= ~(1ULL << i);
     next.buttons |= controller_map_apply(controllerMap, held) | synthetic;
     pthread_mutex_lock(&gamepadLock);
-    pressedEdges |= next.buttons & ~gamepadState.buttons;
-    gamepadState = next;
+    p->pressedEdges |= next.buttons & ~p->state.buttons;
+    p->state = next;
     pthread_mutex_unlock(&gamepadLock);
+}
+
+/* The player lights show the slot (GameController numbers four players; slots 4-7 leave the light unset). */
+static void show_player(GCController *controller, int slot) {
+    controller.playerIndex = slot >= 0 && slot < 4 ? (GCControllerPlayerIndex)(GCControllerPlayerIndex1 + slot) : GCControllerPlayerIndexUnset;
 }
 
 static void attach_gamepad(GCController *controller) {
     GCExtendedGamepad *pad = controller.extendedGamepad;
     if (!pad) return;
+    int slot = slot_of(controller);
+    if (slot < 0) for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS && slot < 0; i++) if (!slotOwner[i]) { slotOwner[i] = controller; slot = i; }
+    if (slot < 0) {
+        fprintf(stderr, "[ssbu-input] native gamepad ignored, all %d players taken: %s\n", RUNTIME_GAMEPAD_SLOTS,
+                (controller.vendorName ?: @"unknown").UTF8String);
+        return;
+    }
+    show_player(controller, slot);
     pad.valueChangedHandler = ^(GCExtendedGamepad *changed, GCControllerElement *element) {
         (void)changed; (void)element;
-        refresh_gamepads();
+        int now = slot_of(controller);
+        if (now >= 0) refresh_slot(now);
     };
-    fprintf(stderr, "[ssbu-input] native gamepad connected: %s (%s), face buttons by %s\n",
+    fprintf(stderr, "[ssbu-input] native gamepad connected as player %d: %s (%s), face buttons by %s\n", slot + 1,
             (controller.vendorName ?: @"unknown").UTF8String,
             (controller.productCategory ?: @"unknown").UTF8String, face_by_position(controller) ? "position" : "label");
     runtime_feedback_attach(controller);
-    refresh_gamepads();
+    refresh_slot(slot);
+}
+
+static void detach_gamepad(GCController *controller) {
+    int slot = slot_of(controller);
+    fprintf(stderr, "[ssbu-input] native gamepad disconnected (player %d): %s\n", slot + 1,
+            (controller.vendorName ?: @"unknown").UTF8String);
+    controller.extendedGamepad.valueChangedHandler = nil;
+    runtime_feedback_detach(controller);
+    if (slot < 0) return;
+    if (!mergePads) slotOwner[slot] = nil;
+    refresh_slot(slot);
 }
 
 void runtime_gamepad_start(void) {
     if (started) return;
     started = YES;
+    mergePads = getenv("SSBU_MERGE_PADS") && atoi(getenv("SSBU_MERGE_PADS"));
+    if (mergePads) fprintf(stderr, "[ssbu-input] SSBU_MERGE_PADS: every controller is player 1\n");
     load_controller_map();
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     [center addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
                    usingBlock:^(NSNotification *notification) { attach_gamepad(notification.object); }];
     [center addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
-                   usingBlock:^(NSNotification *notification) {
-                       GCController *controller = notification.object;
-                       fprintf(stderr, "[ssbu-input] native gamepad disconnected: %s\n",
-                               (controller.vendorName ?: @"unknown").UTF8String);
-                       runtime_feedback_detach(controller);
-                       refresh_gamepads();
-                   }];
+                   usingBlock:^(NSNotification *notification) { detach_gamepad(notification.object); }];
     for (GCController *controller in GCController.controllers) attach_gamepad(controller);
     [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
 }
 
 void runtime_gamepad_clear(void) {
     runtime_feedback_quiet();
-    physicalPrev = 0;
-    memset(tapUntil, 0, sizeof tapUntil);
-    memset(toggleOn, 0, sizeof toggleOn);
-    memset(toggleMoved, 0, sizeof toggleMoved);
     pthread_mutex_lock(&gamepadLock);
-    gamepadState = (RuntimeGamepadState){0};
-    pressedEdges = 0;
+    for (int s = 0; s < RUNTIME_GAMEPAD_SLOTS; s++) {
+        PadSlot *p = &slots[s];
+        p->physicalPrev = 0;
+        memset(p->tapUntil, 0, sizeof p->tapUntil);
+        memset(p->toggleOn, 0, sizeof p->toggleOn);
+        memset(p->toggleMoved, 0, sizeof p->toggleMoved);
+        int connected = p->state.connected;
+        p->state = (RuntimeGamepadState){.connected = connected};
+        p->pressedEdges = 0;
+    }
     pthread_mutex_unlock(&gamepadLock);
 }
 
@@ -177,20 +216,39 @@ void runtime_gamepad_clear(void) {
    controllers: buttons are OR-ed (a tap shorter than one game frame is latched like a controller press), each stick
    axis takes the stronger value. */
 static RuntimeGamepadState touchState;
+static uint64_t touchEdges;
 void runtime_touch_pad_set(const RuntimeGamepadState *s) {
     pthread_mutex_lock(&gamepadLock);
-    pressedEdges |= s->buttons & ~touchState.buttons;
+    touchEdges |= s->buttons & ~touchState.buttons;
     touchState = *s;
     pthread_mutex_unlock(&gamepadLock);
 }
 
-void runtime_gamepad_read(RuntimeGamepadState *out) {
+/* Slot 0 (player 1) also carries the touch controls. */
+void runtime_gamepad_read_slot(int slot, RuntimeGamepadState *out) {
+    if (slot < 0 || slot >= RUNTIME_GAMEPAD_SLOTS) { *out = (RuntimeGamepadState){0}; return; }
     pthread_mutex_lock(&gamepadLock);
-    *out = gamepadState;
-    out->buttons |= touchState.buttons | pressedEdges;
-    out->lx = stronger_axis(out->lx, touchState.lx); out->ly = stronger_axis(out->ly, touchState.ly);
-    out->rx = stronger_axis(out->rx, touchState.rx); out->ry = stronger_axis(out->ry, touchState.ry);
-    if (touchState.connected) out->connected = 1;
-    pressedEdges = 0;
+    PadSlot *p = &slots[slot];
+    *out = p->state;
+    out->buttons |= p->pressedEdges;
+    p->pressedEdges = 0;
+    if (slot == 0) {
+        out->buttons |= touchState.buttons | touchEdges;
+        out->lx = stronger_axis(out->lx, touchState.lx); out->ly = stronger_axis(out->ly, touchState.ly);
+        out->rx = stronger_axis(out->rx, touchState.rx); out->ry = stronger_axis(out->ry, touchState.ry);
+        if (touchState.connected) out->connected = 1;
+        touchEdges = 0;
+    }
     pthread_mutex_unlock(&gamepadLock);
+}
+
+void runtime_gamepad_read(RuntimeGamepadState *out) { runtime_gamepad_read_slot(0, out); }
+
+uint32_t runtime_gamepad_connected_mask(void) {
+    uint32_t mask = 0;
+    pthread_mutex_lock(&gamepadLock);
+    for (int s = 0; s < RUNTIME_GAMEPAD_SLOTS; s++) if (slots[s].state.connected) mask |= 1u << s;
+    if (touchState.connected) mask |= 1;
+    pthread_mutex_unlock(&gamepadLock);
+    return mask;
 }
