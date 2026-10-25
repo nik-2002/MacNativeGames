@@ -58,7 +58,11 @@ NSString *totk_rt_dir(void) {
 #if TARGET_OS_IPHONE
         g_dir = e ? @(e) : [NSString stringWithFormat:@"shader-cache/rt-%s", DMSH_CHAIN];   // in Documents (the app's working directory)
 #else
-        g_dir = e ? @(e) : [root_dir() stringByAppendingFormat:@"/build/shader-cache/rt-%s", DMSH_CHAIN];
+        /* SSBU_CACHE_ROOT (set by the launcher: Application Support/MacNativeGames/SSBU): the cache lives outside the app and
+           the work folder, shared by both; without it, next to the executable as before. */
+        const char *croot = getenv("SSBU_CACHE_ROOT");
+        g_dir = e ? @(e) : croot && *croot ? [@(croot) stringByAppendingFormat:@"/shader-cache/rt-%s", DMSH_CHAIN]
+                                           : [root_dir() stringByAppendingFormat:@"/build/shader-cache/rt-%s", DMSH_CHAIN];
 #endif
         [NSFileManager.defaultManager createDirectoryAtPath:g_dir withIntermediateDirectories:YES attributes:nil error:nil];
         const char *seedMode = getenv("TOTK_SHADER_SEED");

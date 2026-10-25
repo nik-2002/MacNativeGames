@@ -246,6 +246,18 @@ int main(int argc, char **argv) {
         NSString *profile = [data stringByAppendingPathComponent:@"profile"], *slot = [data stringByAppendingPathComponent:@"game-slot"];
         if (!make_dir(profile) || !make_dir(slot) || !make_dir(logs)) { fail([NSString stringWithFormat:@"%@", data]); return 1; }
         if (chdir(work.fileSystemRepresentation)) { fail(work); return 1; }   // the runtime reads extracted/ and rewritten/ relative to it
+        /* Shaders: translation cache and compiled libraries in Application Support, not in the work folder or the app
+           bundle (play wrote into the signed bundle). The first start clones the work folder's ones there (APFS clone:
+           instant, no extra space); the work folder's copies are left alone. SSBU_CACHE_ROOT=<dir> chooses another place. */
+        const char *cacheEnv = getenv("SSBU_CACHE_ROOT");
+        NSString *cacheRoot = cacheEnv && *cacheEnv ? @(cacheEnv) : data;
+        for (NSString *sub in @[@"shader-cache", @"shader-libs"]) {
+            NSString *to = [cacheRoot stringByAppendingPathComponent:sub], *from = [work stringByAppendingPathComponent:[@"build" stringByAppendingPathComponent:sub]];
+            NSFileManager *fm = NSFileManager.defaultManager; NSError *err = nil;
+            if ([fm fileExistsAtPath:to] || ![fm fileExistsAtPath:from]) continue;
+            if (![fm copyItemAtPath:from toPath:to error:&err]) NSLog(@"shader %@ not copied to %@: %@", sub, to, err.localizedDescription);
+        }
+        setenv("SSBU_CACHE_ROOT", cacheRoot.fileSystemRepresentation, 1);
 
         /* No SSBU patch tables exist yet; the runtime treats an empty list as "none". */
         setenv("SSBU_PATCHES", "", 1);

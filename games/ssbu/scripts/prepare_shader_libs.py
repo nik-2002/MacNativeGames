@@ -11,6 +11,7 @@ used.
 
     xcodebuild -downloadComponent MetalToolchain      (once)
     python3 scripts/prepare_shader_libs.py --work SSBU_build
+    python3 scripts/prepare_shader_libs.py --cache-root ~/Library/Application\ Support/MacNativeGames/SSBU   (the app's cache)
 """
 import argparse
 import concurrent.futures
@@ -37,9 +38,12 @@ def metal_compiler():
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--work', type=Path, default=Path('SSBU_build'), help='the work folder (default: SSBU_build)')
+    p.add_argument('--cache-root', type=Path,
+                   help='where shader-cache/ and shader-libs/ live (the app: ~/Library/Application Support/MacNativeGames/SSBU; '
+                        'default: <work>/build)')
     p.add_argument('--jobs', type=int, default=max(1, min(8, (os.cpu_count() or 4) - 2)))
     args = p.parse_args(argv)
-    build = args.work / 'build'
+    build = args.cache_root or args.work / 'build'
     caches = sorted(build.glob('shader-cache/rt-*'))
     if not caches:
         raise SystemExit(f'no translation cache in {build}/shader-cache')
