@@ -132,16 +132,21 @@ static void verify_image(int fd,const char *dir) {
  const char *pdir=getenv("TOTK_ROMFS_PROOF_DIR");if(pdir&&*pdir)dir=pdir;
  struct stat before,after;need(fstat(fd,&before)==0&&S_ISREG(before.st_mode),"RomFS image stat");
  RomfsProof want=proof_for(&before),saved;
- char path[4096],tmp[4096];need(snprintf(path,sizeof(path),"%s/.romfs-verified-v1",dir)<(int)sizeof(path),"RomFS proof path");
+ /* One record per image (device and inode in the name): the app's copy and a work folder's copy share the proof
+    directory, and with a single record each start of the other copy hashed all 17.6 GB again (14 s, 2026-10-25). The
+    record of the old shared name is still accepted when it is this image's. */
+ char path[4096],tmp[4096],legacy[4096];
+ need(snprintf(path,sizeof(path),"%s/.romfs-verified-v1-%llx-%llx",dir,(unsigned long long)want.dev,(unsigned long long)want.ino)<(int)sizeof(path),"RomFS proof path");
+ need(snprintf(legacy,sizeof(legacy),"%s/.romfs-verified-v1",dir)<(int)sizeof(legacy),"RomFS proof path");
  int force=getenv("TOTK_ROMFS_VERIFY")&&!strcmp(getenv("TOTK_ROMFS_VERIFY"),"full");
- int proof_fd=open(path,O_RDONLY|O_NOFOLLOW);
+ int proof_fd=open(path,O_RDONLY|O_NOFOLLOW);if(proof_fd<0)proof_fd=open(legacy,O_RDONLY|O_NOFOLLOW);
  if(proof_fd>=0){struct stat ps;int ok=fstat(proof_fd,&ps)==0&&S_ISREG(ps.st_mode)&&ps.st_size==sizeof(saved)&&read(proof_fd,&saved,sizeof(saved))==sizeof(saved);close(proof_fd);
   if(ok&&!force&&proof_equal(&saved,&want)){fprintf(stderr,"[ssbu] RomFS unchanged; reused full SHA256 verification record (%llu bytes)\n",(unsigned long long)want.size);runtime_boot_progress(TOTK_UI("游戏资源校验记录有效","Game data verification record is valid"),want.size,want.size);return;}}
  fprintf(stderr,"[ssbu] verifying local RomFS SHA256 (%llu bytes)%s\n",(unsigned long long)want.size,force?" [forced]":"");
  runtime_boot_progress(TOTK_UI("校验游戏资源","Verifying game data"),0,want.size);sha_fd(fd,ROMFS_IMAGE_SHA256,want.size,TOTK_UI("校验游戏资源","Verifying game data"));
  need(fstat(fd,&after)==0,"RomFS image stat after hash");
  RomfsProof finished=proof_for(&after);need(proof_equal(&want,&finished),"RomFS changed during verification");
- if(snprintf(tmp,sizeof(tmp),"%s/.romfs-verified-v1.%ld.tmp",dir,(long)getpid())>=(int)sizeof(tmp))return;
+ if(snprintf(tmp,sizeof(tmp),"%s.%ld.tmp",path,(long)getpid())>=(int)sizeof(tmp))return;
  int out=open(tmp,O_WRONLY|O_CREAT|O_EXCL,0600);
  if(out>=0){ssize_t n=write(out,&want,sizeof(want));int ok=n==sizeof(want)&&fsync(out)==0;close(out);
   if(ok){if(rename(tmp,path)!=0)unlink(tmp);}else unlink(tmp);}

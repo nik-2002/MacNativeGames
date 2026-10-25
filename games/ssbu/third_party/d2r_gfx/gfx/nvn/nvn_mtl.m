@@ -6599,7 +6599,11 @@ static void warm_load_keys(NSArray<NSString *> *keys, NSArray<NSNumber *> *stage
     if (workers > n) workers = n;
     warm_par *wp = calloc(1, sizeof *wp); if (!wp) MDIE("预热：内存不足");
     wp->lock = OS_UNFAIR_LOCK_INIT;
-    dispatch_apply(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t w) {
+    /* Before the game starts (the loading screen) the warm-up has the machine; after it (in play: the cache top-up) it
+       yields to the game: utility priority (SSBU, 2026-10-25: the top-up kept all four efficiency cores busy during the
+       intro and the movie's start hitched for 1.3 s). */
+    qos_class_t qos = atomic_load(&g_warm_in_play) ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED;
+    dispatch_apply(workers, dispatch_get_global_queue(qos, 0), ^(size_t w) {
         for (;;) @autoreleasepool {
             if (w && w >= (size_t)warm_threads_now()) break;   // fewer threads once playing; thread 0 always goes on
             size_t i = atomic_fetch_add(&wp->next, 1);
