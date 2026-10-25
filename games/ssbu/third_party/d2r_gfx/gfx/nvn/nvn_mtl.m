@@ -826,7 +826,12 @@ static uint64_t g_usnap_t[3];   // TOTK (2026-10-16): where the snapshot's time 
 static uint64_t g_fc_t[6], g_fc_n, g_fc_begin0, g_fc_snap_end, g_exp_skip_fs_n;
 static int usnap_on(void) {
     int v = atomic_load(&g_usnap_on);
-    if (v < 0) { const char *e = getenv("TOTK_UBO_SNAPSHOT"); v = !(e && !strcmp(e, "0")); atomic_store(&g_usnap_on, v); fprintf(stderr, "[dm] [nvn-mtl] uniform 内容按提交时刻快照：%s\n", v ? "开" : "关（读实时内存，旧行为）"); }
+    /* SSBU: off unless TOTK_UBO_SNAPSHOT=1. With the copy taken at submit, the versus screen, the match intro and their
+       2D layouts came out magnified about 2x around the top-left corner: the layout transforms in the copy were not
+       the ones the frame was drawn with, so Smash finishes some uniforms after the submission that uses them. Reading
+       live memory (as the GPU does on the console) draws those frames correctly (2026-10-25, A/B on the same screens).
+       The race the snapshot fixes is TOTK's. */
+    if (v < 0) { const char *e = getenv("TOTK_UBO_SNAPSHOT"); v = e && !strcmp(e, "1"); atomic_store(&g_usnap_on, v); fprintf(stderr, "[dm] [nvn-mtl] uniform 内容按提交时刻快照：%s\n", v ? "开" : "关（读实时内存，旧行为）"); }
     return v;
 }
 static int usnap_first(uint64_t a) {   // first region whose end is above a
