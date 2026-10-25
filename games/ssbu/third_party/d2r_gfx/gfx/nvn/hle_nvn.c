@@ -297,8 +297,41 @@ NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b,ptrdiff_t off,size_t siz
 
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
+/* SSBU: texture pool bases. NVN texture ids index the texture pool the command buffer has bound, and SSBU binds two pools
+   every frame (8448 and 4096 descriptors) whose ids overlap. The replay keeps one registration table, so each pool gets
+   its own range in it: a registration lands at base + id, and every texture / image handle a command buffer binds is
+   moved by the base of the pool that command buffer set (bind_handles_rec, resolve_deferred). Before, the two pools
+   overwrote each other's slots: wrong and missing textures in menus and matches (2026-10-25).
+   The two sampler pools (2304 and 4096) get the same treatment for the sampler id, bits 20 and up of a handle (the
+   replay keeps handles in 64 bits and reads the sampler id as h >> 20, so ids past 4095 fit). */
+static int32_t g_tpool_next, g_spool_next;
+static nvn_hmap g_cb_pbase = {.klen = 8};   // command buffer -> 1 + texture base | sampler base << 16 of its bound pools
+static pthread_mutex_t g_cb_pbase_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t cb_pbase(const NVNcommandBuffer *c) {
+    uintptr_t k = (uintptr_t)c; pthread_mutex_lock(&g_cb_pbase_mu); uintptr_t v = (uintptr_t)nvn_hm_get(&g_cb_pbase, &k); pthread_mutex_unlock(&g_cb_pbase_mu);
+    return v ? (uint32_t)(v - 1) : 0;
+}
+static void cb_pbase_set(const NVNcommandBuffer *c, int sampler, int32_t base) {
+    uintptr_t k = (uintptr_t)c; pthread_mutex_lock(&g_cb_pbase_mu);
+    uintptr_t v = (uintptr_t)nvn_hm_get(&g_cb_pbase, &k); uint32_t b = v ? (uint32_t)(v - 1) : 0;
+    b = sampler ? (b & 0xffffu) | (uint32_t)base << 16 : (b & ~0xffffu) | (uint32_t)base;
+    nvn_hm_put(&g_cb_pbase, &k, (void *)(uintptr_t)(b + 1)); pthread_mutex_unlock(&g_cb_pbase_mu);
+}
+/* Moves the handles of one bind record by its pools' bases (pbase as cb_pbase): the texture id (low 20 bits) of texture and
+   image handles, the sampler id (bits 20 up) of texture and sampler handles. Sampler id 0 stays 0 (the replay reads it as
+   "no sampler"). */
+static void handles_rebase(int op, uint64_t *h, int n, uint32_t pbase) {
+    uint64_t tb = pbase & 0xffffu, sb = pbase >> 16;
+    for (int k = 0; k < n; k++) { if (!h[k]) continue;
+        if (tb && op != OP_BIND_SAMP) h[k] = (h[k] & ~0xfffffull) | (((h[k] & 0xfffff) + tb) & 0xfffff);
+        if (sb && op != OP_BIND_IMG && h[k] >> 20) h[k] = (h[k] & 0xfffffull) | (((h[k] >> 20) + sb) << 20); }
+}
 NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
-    *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; OLOG("TexturePool n=%d", n); mtl_set_tex_pool_n(n); return 1;
+    int32_t base = g_tpool_next;
+    if (n < 0 || (int64_t)base + n > 0xffff) die("texture pools: %d + %d descriptors do not fit the 16-bit pool base", base, n);
+    g_tpool_next += n;
+    *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n, base}; LOG("[nvn] texture pool %p: %d descriptors, ids from %d", (void *)tp, n, base);
+    mtl_set_tex_pool_n(g_tpool_next); return 1;
 }
 NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) { (void)tp; }
 extern uint64_t g_frame_pub;
@@ -308,6 +341,7 @@ NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const
         if ((want >= 0 && id == want) || (rf0 >= 0 && (long)g_frame_pub >= rf0 && (long)g_frame_pub <= rf1)) { const tex_t *x = (const tex_t *)t; const view_t *vv = (const view_t *)v;
             LOG("[reglog] F%llu id=%d ser=%llu fmt=%#x %ux%u lv%u flags=%#x mem=%p pool=%p off=%lld view=%s vfmt=%#x vlv=%d+%d", (unsigned long long)g_frame_pub, id, (unsigned long long)x->serial, x->d.format, x->d.width, x->d.height, x->d.levels, x->d.flags, (void *)x->mem, (void *)x->pool, (long long)x->off,
                 vv ? "yes" : "no", vv && vv->set_format ? vv->format : 0, vv && vv->set_levels ? vv->base_level : -1, vv && vv->set_levels ? vv->nlevels : 0); } }
+    id += tp ? ((const dpool_t *)tp)->base : 0;   // SSBU: this pool's range (texture pool bases)
     totk_life_reg(id, (const tex_t *)t);
     mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v); }
 
@@ -317,10 +351,13 @@ NVN(nvnTexturePoolRegisterImage, void, const NVNtexturePool *tp, int id, const N
     h_nvnTexturePoolRegisterTexture(tp, id, t, v);
 }
 NVN(nvnSamplerPoolInitialize, NVNboolean, NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
-    *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n); return 1;
+    int32_t base = g_spool_next;
+    if (n < 0 || (int64_t)base + n > 0xffff) die("sampler pools: %d + %d descriptors do not fit the 16-bit pool base", base, n);
+    g_spool_next += n;
+    *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n, base}; LOG("[nvn] sampler pool %p: %d descriptors, ids from %d", (void *)sp, n, base); return 1;
 }
 NVN(nvnSamplerPoolFinalize, void, NVNsamplerPool *sp) { (void)sp; }
-NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) { (void)sp; mtl_reg_samp(id, &((const samp_t *)s)->p); }
+NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) { mtl_reg_samp(id + (sp ? ((const dpool_t *)sp)->base : 0), &((const samp_t *)s)->p); }
 
 // ---------- 贴图 ----------
 // ---------- Textures ----------
@@ -402,7 +439,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
         mtl_tex_release(o);
     }
     memset(o, 0, sizeof *o);
-    o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
+    o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off; o->pool_bits = tex_pool_bits(s->pool);
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8);
     nvn_tex_layout(&o->d, &o->L);
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
@@ -1855,8 +1892,9 @@ static void life_bind(NVNcommandBuffer *c, int op, int st, int slot, const uint6
 }
 static void bind_handles_rec(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h, int deferred) {
     if (n < 0 || n > 32) { LOG("【红】绑定句柄数 %d", n); return; }
-    p_bind_handles *r = RECN(c, op, p_bind_handles, h, n); r->stage = st; r->first = first; r->n = n; r->pad_ = 0;
-    r->src = deferred ? (uint64_t)(uintptr_t)h : 0; memcpy(r->h, h, 8 * n);
+    p_bind_handles *r = RECN(c, op, p_bind_handles, h, n); r->stage = st; r->first = first; r->n = n;
+    r->pad_ = (int32_t)cb_pbase(c);   // SSBU: the bound pools' bases, kept for resolve_deferred (texture pool bases)
+    r->src = deferred ? (uint64_t)(uintptr_t)h : 0; memcpy(r->h, h, 8 * n); handles_rebase(op, r->h, n, (uint32_t)r->pad_);
     if (totk_life_on() && (op == OP_BIND_TEX || op == OP_BIND_IMG)) for (int k = 0; k < n; k++) life_bind(c, op, st, first + k, h + k, deferred);
     hw_fix(CB(c), 16 + 4 * (size_t)n);   /* macro 7 + method 0x1a2c + CB_POS and one 32-bit handle word per binding (64-bit handles: callers override with 16 + 8n) */
 }
@@ -1885,7 +1923,7 @@ static void resolve_deferred(const uint8_t *p, int depth) {   // read the handle
         else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
             p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
             if (b->src && b->n > 0 && b->n <= 32) {
-                uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++;
+                uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++; handles_rebase(h.op, cur, b->n, (uint32_t)b->pad_);
                 if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
                     if (g_def_logged++ < 6) LOG("[nvn] 延迟绑定在提交时读到新句柄：阶段 %d 槽 %d 起，录制时 %#llx → 提交时 %#llx", b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
                     g_def_changed++; memcpy(b->h, cur, 8 * (size_t)b->n);
@@ -2022,8 +2060,12 @@ NVN(nvnCommandBufferDispatchComputeIndirect, void, NVNcommandBuffer *c, NVNbuffe
     *REC(c, OP_DISPATCH, p_dispatch) = (p_dispatch){DISPATCH_INDIRECT, 0, 0, (uint64_t)addr};
 }
 NVN(nvnCommandBufferBarrier, void, NVNcommandBuffer *c, int bits) { *(int32_t *)rec(c, OP_BARRIER, 8) = bits; }
-NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) { REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; }
-NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) { REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; }
+NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) {
+    cb_pbase_set(c, 0, p ? ((const dpool_t *)p)->base : 0);   // SSBU: texture pool bases
+    REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; }
+NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) {
+    cb_pbase_set(c, 1, p ? ((const dpool_t *)p)->base : 0);   // SSBU: texture pool bases (sampler pools)
+    REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; }
 
 NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAddress src, const NVNtexture *t, const NVNtextureView *v,
     const NVNcopyRegion *r, int flags) {

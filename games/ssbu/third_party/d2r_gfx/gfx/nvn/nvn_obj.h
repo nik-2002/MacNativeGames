@@ -24,7 +24,8 @@ typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } poo
 // game_mem/host/span: TOTK host-owned VM storage for physical/virtual pools (totk_vpool.c); host is NULL for game-backed pools.
 typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; uint8_t *game_mem, *host; uint64_t span; } pool_t; FITS(pool_t, NVNmemoryPool);
 
-typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // 贴图 / 采样器描述符池 | Texture / sampler descriptor pool
+// base (SSBU): where this texture pool's ids start in the replay's one registration table (hle_nvn.c, texture pool bases)
+typedef struct { const pool_t *pool; int64_t off; int32_t n, base; } dpool_t;                 // 贴图 / 采样器描述符池 | Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
 
 typedef struct {
@@ -32,8 +33,18 @@ typedef struct {
     uint8_t has_layout, layout[8];
     const void *pkg_data;                // TOTK: SetPackagedTextureData source, copied into storage at Initialize
 } tex_builder_t;                                                                             FITS(tex_builder_t, NVNtextureBuilder);
+/* SSBU: what the replay layer needs to know about a texture's pool, taken at nvnTextureInitialize while the pool is
+   alive. The game finalises and frees pools (stage unload) while texture pool slots still name textures in them; on
+   hardware a stale descriptor never reads the pool object, so the replay layer must not either (2026-10-25: a match
+   start faulted reading pool->host of a freed pool in tex_mirrored). */
+enum { TEX_POOL_MIRROR = 1, TEX_POOL_COMPRESSIBLE = 2 };
+static inline uint8_t tex_pool_bits(const pool_t *p) {
+    if (!p) return 0;
+    return (uint8_t)((!p->host && (p->flags & (NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_CPU_CACHED)) ? TEX_POOL_MIRROR : 0) |
+                     (p->flags & NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE ? TEX_POOL_COMPRESSIBLE : 0));
+}
 typedef struct {
-    uint32_t magic; nvn_texdesc d; uint8_t has_layout, layout[8];
+    uint32_t magic; nvn_texdesc d; uint8_t has_layout, layout[8], pool_bits;   // pool_bits: tex_pool_bits of pool at Initialize
     nvn_texlayout L; uint8_t *mem; pool_t *pool; int64_t off;
     uint64_t serial;                     // 初始化序号：回放层按它在宿主表里找 MTLTexture（游戏可能按值拷贝对象，不能存对象指针） | Initialization serial: the replay layer uses it to find the MTLTexture in the host table (the game may copy the object by value, so object pointers cannot be stored)
 } tex_t;                                                                                     FITS(tex_t, NVNtexture);

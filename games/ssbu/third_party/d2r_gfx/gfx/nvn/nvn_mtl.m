@@ -2744,7 +2744,7 @@ static id<MTLTexture> stor_recreate(const stor_key *k, MTLTextureUsage usage) {
    TOTK_COMPRESSED_ALIAS=1 shares across formats as before (A/B). */
 static uint64_t g_stor_handover, g_stor_taken_back;
 static stor_ent **g_stor_det; static int g_stor_ndet, g_stor_cdet;   // detached entries (g_smu)
-static int stor_compressed(const tex_t *t) { return (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE); }
+static int stor_compressed(const tex_t *t) { return (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && (t->pool_bits & TEX_POOL_COMPRESSIBLE); }
 static int compressed_alias_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_COMPRESSED_ALIAS"); on = e && atoi(e); } return on; }
 static void stor_det_push_locked(stor_ent *e) {
     if (g_stor_ndet == g_stor_cdet) { g_stor_cdet = g_stor_cdet ? g_stor_cdet * 2 : 16; g_stor_det = realloc(g_stor_det, (size_t)g_stor_cdet * sizeof *g_stor_det); if (!g_stor_det) MDIE("detached storage list"); }
@@ -3210,6 +3210,10 @@ static int pkg_edge_clean(const tex_t *t, NvPkg *pk) {   // 1: only the shared p
     return 1;
 }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key, NvPkg *pk);
+/* SSBU: set when pkg_upload's fault guard found the texture's storage unmapped (a pool slot naming a texture in freed
+   memory). Its contents must then never be read unguarded: no content hash, which faulted right after the guarded upload
+   (2026-10-25, stage select). */
+static int g_up_faulted;
 static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp, reup_key *key, NvPkg *pk) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
     id<MTLTexture> r = pkg_upload_(t, stamp, key, pk);
@@ -3453,6 +3457,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key
         runtime_fault_guard = NULL;
         if (cur_cb) free(cur_cb);
         RED_ONCE(48, "【红】CPU 贴图上传读到不可访问的地址 (mem=%p format=%#x)：跳过此贴图", t->mem, t->d.format);
+        g_up_faulted = 1;
         return mt;
     }
     /* TOTK: during a replay submission the batch is flushed by mtl_sub_commit (or q_cb) before the game command buffer,
@@ -3471,8 +3476,7 @@ static int tex_mirrored(const tex_t *t) {
     if (t->has_layout) return 1;
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_TEX_MIRROR"); on = !e || atoi(e); }
     if (!on) return 0;
-    const pool_t *p = t->pool;
-    if (!p || p->host || !(p->flags & (NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_CPU_CACHED))) return 0;
+    if (!(t->pool_bits & TEX_POOL_MIRROR)) return 0;   // SSBU: never t->pool here, the pool may be freed (nvn_obj.h)
     if (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL |
                       NVN_TEXTURE_FLAGS_DEPTH16_PREFER_FAST_CLEAR | NVN_TEXTURE_FLAGS_ZCULL_SUPPORT_STENCIL)) return 0;
     if (t->d.samples > 1 || t->d.target == 10) return 0;
@@ -3534,14 +3538,16 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
         TILELOG(t, "first upload from the pool bytes");
         NvPkg *npk = [NvPkg new]; pk = npk;
         pk->lo = (uintptr_t)t->mem; pk->hi = pk->lo + t->L.size;
+        g_up_faulted = 0;
         pk->tex = pkg_upload(t, &pk->stamp, &pk->key, pk);
         if (!pk->tex) return nil;
+        int faulted = g_up_faulted; g_up_faulted = 0;
         /* TOTK (#90): seen = the upload's stamp, not "now": a write that faulted during the copy moved "now" on, and the
            now == seen shortcut above then called the texture clean without looking at its pages. */
         pk->seen = pk->stamp; g_pkg_uploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size);
         serial_put(t->serial, pk);
         pk->owned = gpu_owned(t->serial);   // after it is in the table: a later mark finds it there (pkg_owned_locked)
-        if ((pk->hashed = pkg_hashed(t))) { pk->chash = pkg_hash(t->mem, t->L.size); pk->csub = g_sub_serial; }
+        if ((pk->hashed = !faulted && pkg_hashed(t))) { pk->chash = pkg_hash(t->mem, t->L.size); pk->csub = g_sub_serial; }
         if (serial_is_dead(t->serial)) dead_put_note(t->serial);
         return pk->tex;
     }
@@ -3572,6 +3578,15 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
         mt = [g_dev newTextureWithDescriptor:d];
         if (!mt) { RED_ONCE(2, "建 MTLTexture 失败 %ux%u 格式 %#x 目标 %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
         res_add(mt);
+        /* SSBU: a new Metal texture's contents are undefined; the window images live in zeroed pool memory on hardware.
+           SSBU presents its first window image before it draws into it, and that frame came up solid magenta
+           (2026-10-25, present 1 of every boot). Display textures start cleared to 0, as the memory under them would be. */
+        if ((t->d.flags & NVN_TEXTURE_FLAGS_DISPLAY) && (d.usage & MTLTextureUsageRenderTarget)) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = mt; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLCommandBuffer> cb = q_cb(); [[cb renderCommandEncoderWithDescriptor:rp] endEncoding]; cb_commit(cb); cb_wait(cb);
+        }
         stor_publish(t, mt);
     }
     serial_put(t->serial, mt);
@@ -5392,7 +5407,10 @@ static MTLTextureType ttype(int target, int fallback) {
 // Out-of-pool texture ID = empty slot: the game itself uses GetSeparateTextureHandle(0xFFFFF) to get a handle and bind it to unused slots (measured call site main+0x1746820,
 // texture pool capacity 15256) and never registers that ID. Read 0 per D3D / empty-slot semantics (the same all-zero dummy textures as unbound), no failure; unregistered IDs inside the pool are still reported a failure
 static int g_tpool_n; static uint64_t g_stat_tex_oob;
-void mtl_set_tex_pool_n(int n) { g_tpool_n = n; }
+/* SSBU: the replay keeps one registration table for every texture pool, so the bound is the largest pool. SSBU initialises
+   two pools and the second (4096 entries) is not the one its match materials live in: the last pool's size turned every id
+   from 4096 up into an empty slot, and stages and fighters drew with the dummy texture (2026-10-25: black / white match). */
+void mtl_set_tex_pool_n(int n) { if (n > g_tpool_n) g_tpool_n = n; MLOG("texture pool of %d descriptors (ids below %d are looked up)", n, g_tpool_n); }
 /* DM_NVN_LIFELOG (see totk_lifelog.h): the texture the replay resolves for a followed texture-pool id, once per frame and id. */
 static void life_use(int tid, const tex_t *t, const char *how) {
     static uint64_t frame = ~0ull; static int seen[64]; static int nseen;
@@ -5406,6 +5424,14 @@ static void life_use(int tid, const tex_t *t, const char *how) {
 static int tex_check_once(void);
 static inline uint64_t treg_stamp(int kind) { return kind == 2 || (kind == 1 && tex_check_once()) ? g_sub_serial : nvn_dirty_now(); }
 static uint8_t treg_kind(const tex_t *t) { return tex_mirrored(t) ? (pkg_hashed(t) ? 2 : 1) : 0; }
+/* SSBU diagnostic (2026-10-25): why a registered texture id gave the draw no texture (the material textures of a match
+   were bound as the dummy). First 80 cases. */
+static void tbid_nil(int tid, const tex_t *t, const char *why) {
+    static _Atomic int n; if (atomic_fetch_add(&n, 1) >= 80) return;
+    MLOG("[ssbu-tex] id %d: no texture (%s) ser=%llu fmt=%#x %ux%ux%u lv=%u target=%d flags=%#x mem=%p size=%llu layout=%d pool_bits=%#x mirrored=%d dead=%d split=%d",
+         tid, why, (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, t->d.depth, t->d.levels, (int)t->d.target, t->d.flags, (void *)t->mem,
+         (unsigned long long)t->L.size, t->has_layout, t->pool_bits, tex_mirrored(t), serial_is_dead(t->serial), g_tex_prepare_split);
+}
 static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
     if (g_tpool_n && tid >= g_tpool_n) { if (!g_stat_tex_oob++) MLOG("池外贴图号 %d（池容量 %d）按空槽处理：读出 0", tid, g_tpool_n); return nil; }
     if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) { RED_ONCE(10, "贴图号 %d 未登记", tid); return nil; }
@@ -5444,7 +5470,7 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
     treg_t r = *rp;
     if (!r.has_v) memset(&r.v, 0, sizeof r.v);   // only a registered view may change format, levels, layers or target
     id<MTLTexture> base = tex_mtl(&rp->t);
-    if (!base) return nil;
+    if (!base) { tbid_nil(tid, &rp->t, "tex_mtl"); return nil; }
     v = base;
     MTLTextureSwizzleChannels vsw = MTLTextureSwizzleChannelsDefault;
     int need_swz = tex_swizzle_sel(&r.t, r.has_v && r.v.set_swizzle ? r.v.swz : NULL, r.has_v && r.v.set_format ? r.v.format : r.t.d.format, &vsw) || !swizzle_eq(base.swizzle, MTLTextureSwizzleChannelsDefault);
@@ -13161,7 +13187,7 @@ int mtl_probe_compressed_alias(void) {
         nvn_tex_layout(&depth.d, &depth.L); size_t size = (depth.L.size + getpagesize() - 1) & ~((size_t)getpagesize() - 1);
         void *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (mem == MAP_FAILED) MDIE("compressed-alias probe mmap");
         pool_t pool = {.mem = mem, .size = size, .flags = NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | (compressible ? NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE : 0)};
-        depth.mem = mem; depth.pool = &pool;
+        depth.mem = mem; depth.pool = &pool; depth.pool_bits = tex_pool_bits(&pool);
         tex_t color = depth; color.serial++; color.d.format = 0x25; nvn_tex_layout(&color.d, &color.L);
         if (color.L.size != depth.L.size) MDIE("compressed-alias probe: layouts differ (%llu / %llu)", (unsigned long long)color.L.size, (unsigned long long)depth.L.size);
         probe_clear(&depth, MTLClearColorMake(0.25, 0, 0, 0));                 /* the linear depth, 0.25 = 0x3e800000 */
@@ -13194,7 +13220,7 @@ int mtl_probe_linear_rt_upload(void) {
         tex_t t={0};t.serial=0xffffffe0+mode;t.d=(nvn_texdesc){.width=W,.height=H,.depth=1,.levels=1,.target=1,.format=mode?0x2a:0x6,.flags=NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET};
         nvn_tex_layout(&t.d,&t.L);size_t size=(t.L.size+getpagesize()-1)&~((size_t)getpagesize()-1);
         void *mem=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);if(mem==MAP_FAILED)MDIE("linear-rt probe mmap");
-        pool_t pool={0};pool.mem=mem;pool.size=size;pool.flags=0x24;t.pool=&pool;t.mem=mem;
+        pool_t pool={0};pool.mem=mem;pool.size=size;pool.flags=0x24;t.pool=&pool;t.pool_bits=tex_pool_bits(&pool);t.mem=mem;
         const NSUInteger bpp=mode?8:2,row=W*bpp;uint8_t *pixels=malloc(row*H);
         for(NSUInteger i=0;i<row*H;i++)pixels[i]=(uint8_t)(i*29+i/13+17);
         if(nvn_swizzle(&t.d,0,0,pixels,row,mem))MDIE("linear-rt probe swizzle");
@@ -13227,7 +13253,7 @@ int mtl_probe_texture_retire(void) {
     tex_t t={0}; t.serial=0xffffffb0;t.d=(nvn_texdesc){.width=W,.height=H,.depth=1,.levels=1,.target=1,.format=0x2a,.flags=0x40,.swizzle_r=2,.swizzle_g=3,.swizzle_b=4,.swizzle_a=5};
     nvn_tex_layout(&t.d,&t.L);size_t size=(t.L.size+getpagesize()-1)&~((size_t)getpagesize()-1);
     void *mem=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);if(mem==MAP_FAILED)MDIE("texture retire mmap");
-    pool_t pool={.mem=mem,.size=size,.flags=0x24};t.mem=mem;t.pool=&pool;memset(mem,0,size);
+    pool_t pool={.mem=mem,.size=size,.flags=0x24};t.mem=mem;t.pool=&pool;t.pool_bits=tex_pool_bits(&pool);memset(mem,0,size);
     mtl_pool_add(mem,size);nvn_dirty_add_range(mem,size);
     view_t v={.set_levels=1,.nlevels=1};id __weak old[N]={nil};
     op_hdr end={OP_END,8};id<MTLBuffer> rb=probe_buf(128);uint8_t expected[128];
