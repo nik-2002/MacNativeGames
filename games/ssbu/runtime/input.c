@@ -202,7 +202,7 @@ __attribute__((constructor)) static void input_script_start(void) {
 /* Optional local integration-test command stream. Appending complete lines lets tests inspect each
    actual frame before choosing the next input, instead of guessing load/menu timings. Disabled normally.
    Commands: key <Mac keycode> <milliseconds>, down/up <Mac keycode>, shot <path>, wshot <path>, passdump <frames>, gpucapture <path>.gputrace, querylog <frames>, anomdump,
-   kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), page shot <path> / back / close (the manual page), close. */
+   kbtest / kbtype <text> / kbkey <key> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), page shot <path> / back / close (the manual page), close. */
 extern void dm_gfx_shot_at(long frames, const char *path);
 extern void runtime_front_request_close(void);
 static void *input_file(void *arg) {
@@ -253,6 +253,8 @@ static void *input_file(void *arg) {
             line[strcspn(line, "\r\n")] = 0; runtime_front_text_test("type", line + 7);
         } else if (!strncmp(line, "kbshot ", 7)) {   /* "kbshot <path>": the open bar as a PNG */
             line[strcspn(line, "\r\n")] = 0; runtime_front_text_test("shot", line + 7);
+        } else if (!strncmp(line, "kbkey ", 6)) {   /* "kbkey <key>": an on-screen keyboard key of the open bar ("#+=": symbols) */
+            line[strcspn(line, "\r\n")] = 0; runtime_front_text_test("key", line + 6);
         } else if (!strcmp(line, "kbenter\n") || !strcmp(line, "kbesc\n")) {
             runtime_front_text_test(line[2] == 'e' && line[3] == 'n' ? "enter" : "esc", NULL);
         } else if (sscanf(line, "hletrace %u %n", &code, &used) == 1 && used && !line[used] && code <= 2) {

@@ -270,12 +270,13 @@ static NSString *const KEY_SHIFT=@"\u21E7",*const KEY_SYMBOLS=@"#+=",*const KEY_
 static const double actionUnits[5]={1.5,1.5,4,1.5,1.5};
 -(BOOL)isFlipped{return YES;}
 -(int)columns:(int)r{return r<4?10:5;}
--(NSString *)keyAt:(int)r :(int)c{
+-(NSString *)keyAt:(int)r :(int)c{   /* every row of letters / symbols has 10 keys; a short row gives blank keys, not a crash */
  static NSString *const letters[4]={@"1234567890",@"qwertyuiop",@"asdfghjkl'",@"zxcvbnm,.-"};
- static NSString *const symbols[4]={@"!@#$%^&*()",@"-_=+[]{};:",@"\"/?<>|\\~`",@"\u00E9\u00E8\u00F1\u00FC\u00E7\u00E0\u00F6\u00DF\u2665\u2606"};
- if(r==4)return @[self.symbols?@"abc":KEY_SYMBOLS,KEY_SHIFT,KEY_SPACE,KEY_DELETE,KEY_DONE][c];
- NSString *k=[(self.symbols?symbols:letters)[r] substringWithRange:NSMakeRange((NSUInteger)c,1)];
- return self.shift?k.uppercaseString:k;
+ static NSString *const symbols[4]={@"!@#$%^&*()",@"-_=+[]{};:",@"\"/?<>|\\~`\u20AC",@"\u00E9\u00E8\u00F1\u00FC\u00E7\u00E0\u00F6\u00DF\u2665\u2606"};
+ if(r==4)return c>=0&&c<5?@[self.symbols?@"abc":KEY_SYMBOLS,KEY_SHIFT,KEY_SPACE,KEY_DELETE,KEY_DONE][c]:@"";
+ NSString *row=(self.symbols?symbols:letters)[r];if(c<0||(NSUInteger)c>=row.length)return @"";
+ NSString *k=[row substringWithRange:NSMakeRange((NSUInteger)c,1)],*up=k.uppercaseString;
+ return self.shift&&up.length==1?up:k;   /* ß has no one-letter capital */
 }
 -(NSRect)rectAt:(int)r :(int)c{
  CGFloat gap=6,w=self.bounds.size.width,h=(self.bounds.size.height-4*gap)/5,unit=(w-9*gap)/10,x=0;
@@ -343,7 +344,7 @@ static const double actionUnits[5]={1.5,1.5,4,1.5,1.5};
 -(void)confirm{[self refilter];NSString *s=self.field.stringValue;
  if((NSInteger)s.length<self.minUnits||!s.length){NSBeep();return;}[self finish:s];}
 -(void)key:(NSString *)k{   /* a key of the on-screen keyboard */
- TOTKKeyGrid *g=self.grid;NSString *s=self.field.stringValue;
+ TOTKKeyGrid *g=self.grid;NSString *s=self.field.stringValue;if(!k.length)return;
  if([k isEqualToString:KEY_DONE]){[self confirm];return;}
  if([k isEqualToString:KEY_SHIFT]){g.shift=!g.shift;g.autoShift=NO;g.needsDisplay=YES;return;}
  if([k isEqualToString:KEY_SYMBOLS]||[k isEqualToString:@"abc"]){g.symbols=!g.symbols;g.needsDisplay=YES;return;}
@@ -390,6 +391,7 @@ void runtime_front_text_test(const char *op,const char *text){
    NSData *png=[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];BOOL ok=[png writeToFile:t atomically:YES];
    fprintf(stderr,"[ssbu] keyboard test: bar picture %s %s\n",t.UTF8String,ok?"written":"FAILED");return;}
   else if([o isEqualToString:@"esc"])[bar control:bar.field textView:(NSTextView *)bar.field.currentEditor doCommandBySelector:@selector(cancelOperation:)];
+  else if([o isEqualToString:@"key"])[bar key:t];   /* an on-screen key, as A or a click presses it (#+= symbols, the shift arrow, OK) */
   fprintf(stderr,"[ssbu] keyboard test: %s -> field \"%s\"\n",o.UTF8String,bar.field.stringValue.UTF8String);
  });
 }
