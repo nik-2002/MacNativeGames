@@ -21,7 +21,7 @@
    would pile up in its own queue), and when the game falls behind (a loading hitch: ~15 fps for a few seconds under the
    blood moon) a frame more than 1.5 frame periods late is dropped if the next one is due too: the picture stays in time
    with the cutscene's sound instead of lagging and then running fast to catch up. TOTK_MOVIE_PACE=0 hands every frame
-   over as soon as it is decoded. */
+   over as soon as it is decoded. Not used by SSBU: see pace_on. */
 #include "runtime.h"
 #include "movie_host.h"
 #include <arm_neon.h>
@@ -72,7 +72,10 @@ static int negative(void) { if (g_negative < 0) { const char *e = getenv("TOTK_P
 static uint64_t now_ns(void);
 static uint64_t (*g_clock)(void) = now_ns;
 void movie_host_set_clock(uint64_t (*clock)(void)) { g_clock = clock ? clock : now_ns; }
-static int pace_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_MOVIE_PACE"); v = !(e && !strcmp(e, "0")); } return v; }
+/* SSBU (2026-10-25): off unless TOTK_MOVIE_PACE=1. SSBU times its movies itself (the intro runs its 21 s without host pacing), and
+   its main thread waits for the movie's first frame before it presents again, while paced frames were handed over only at
+   presents: the intro started about 8 s late behind a black screen. */
+static int pace_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_MOVIE_PACE"); v = e && !strcmp(e, "1"); } return v; }
 static Movie *g_movies[MAX_MOVIES];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 

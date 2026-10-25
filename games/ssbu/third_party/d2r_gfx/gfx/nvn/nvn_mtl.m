@@ -76,6 +76,7 @@ static void warm_claim(void);
 int mtl_warm_wait(int timeout_ms);
 extern void runtime_warm_progress(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) __attribute__((weak_import));
 extern void runtime_warm_done(void) __attribute__((weak_import));
+extern void runtime_warm_ready(void) __attribute__((weak_import));   // the game may start: the loading screen goes
 extern void runtime_boot_status(const char *,const char *) __attribute__((weak_import));
 
 static id<MTLDevice> g_dev;
@@ -6567,6 +6568,7 @@ static NvShader *warm_shader(NSMutableDictionary<NSString *, NvShader *> *dict, 
    Mac (at most the core count minus 2), 1 on iOS (prebuilt libraries, nothing to compile). */
 enum { WARM_BLOCK = 512 };   // rows per block: the shaders of a block load in parallel, then its rows run in order
 static _Atomic int g_warm_in_play;
+static _Atomic int g_warm_lists_done;   // every list (title, manifest, user, shared, seed) warmed; the cache top-up may still run
 static int warm_threads(void) {
     static int n; static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -6742,6 +6744,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
             if (path_index++ == 0) atomic_store(&g_warm_priority_done, 1);
         }
         atomic_store(&g_warm_priority_done, 1);
+        atomic_store(&g_warm_lists_done, 1);
         // The native port translates variants as they are discovered. Warm every variant already
         // present in this translation-chain cache before the first playable scene is released.
         NSString *rt = totk_rt_dir();
@@ -6795,6 +6798,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
              (unsigned long long)atomic_load(&g_warm_library_count),atomic_load(&g_warm_library_ns)/1e6,
              (unsigned long long)atomic_load(&g_warm_pipeline_count),atomic_load(&g_warm_pipeline_ns)/1e6);
     }
+    atomic_store(&g_warm_lists_done, 1);
     atomic_store(&g_warm_running, 0);
     if (runtime_warm_done) runtime_warm_done();
 }
@@ -6940,10 +6944,23 @@ static void warm_start(void) {
     // the menu, then mtl_warm_wait at save-load waits before entering play.
     uint64_t wait_start = bp_now();
     while (!atomic_load(&g_warm_priority_done)) usleep(2000);
+    /* SSBU (user, 2026-10-25): the pipelines before the game starts. The rest of the lists used to warm behind the
+       intro movie and the menus on 6 threads (the movie and its sound stuttered, and the player looked at a black screen
+       meanwhile). Now the game waits here for every list -- the pipelines and shaders the game has used -- while the
+       loading screen shows the progress bar (runtime_warm_progress); then the loading screen goes (runtime_warm_ready)
+       and only the cache top-up (variants no list names, for matches) goes on, on at most 2 threads.
+       SSBU_WARM_BEFORE_START=0: the old way (title list only). */
+    const char *before = getenv("SSBU_WARM_BEFORE_START");
+    if (!(before && !atoi(before))) {
+        while (!atomic_load(&g_warm_lists_done)) usleep(2000);
+        atomic_store(&g_warm_in_play, 1);
+    }
+    if (runtime_warm_ready) runtime_warm_ready();
     int ms = (int)((bp_now() - wait_start) / 1000000ull) + 1;
     warm_claim();
-    MLOG("启动关键管线已就绪：等待 %d ms，可用着色器 %lu / 渲染管线 %llu / 计算管线 %llu；其余后台继续预热",
-         ms, (unsigned long)g_shcache.count, g_warm_claim_rps, g_warm_claim_cps);
+    MLOG("启动管线已就绪：等待 %d ms，可用着色器 %lu / 渲染管线 %llu / 计算管线 %llu%s",
+         ms, (unsigned long)g_shcache.count, g_warm_claim_rps, g_warm_claim_cps,
+         atomic_load(&g_warm_running) ? "；其余（缓存补充）后台 2 线程继续预热" : "（全部预热完）");
 }
 static int g_rt_ovr;   // 运行时外推的模板覆盖：0 不覆盖；1 只在单位 / 特效 / 外推洞位（0xD0）上通过、不写模板；3 照常深度测试，通过处写特效位 0x40 | Stencil override for runtime extrapolation: 0 no override; 1 pass only on the unit / effect / extrapolation-hole bits (0xD0), no stencil write; 3 depth test as usual, write the effect bit 0x40 where it passes
 static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {

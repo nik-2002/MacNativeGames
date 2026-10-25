@@ -18,7 +18,7 @@ static NSProgressIndicator *bootProgress;
 static NSView *shortcutHelp;
 static uint64_t bootStartNS;
 static _Atomic uint64_t presentedFrames;
-static _Atomic int warmPending;
+static _Atomic int warmPending,warmStarted;
 static CVDisplayLinkRef displayLink;
 static _Atomic int focused;
 static pthread_mutex_t vsyncLock=PTHREAD_MUTEX_INITIALIZER;
@@ -30,7 +30,10 @@ void *front_metal_layer(void){return (__bridge void *)metalLayer;}
 void front_frame_presented(void){
  if(atomic_fetch_add_explicit(&presentedFrames,1,memory_order_relaxed)==0){
   fprintf(stderr,"[ssbu-boot] %.3f first presented frame\n",(runtime_now_ns()-bootStartNS)/1e9);
-  dispatch_async(dispatch_get_main_queue(), ^{if(!atomic_load(&warmPending))bootOverlay.hidden=YES;});
+  /* The loading screen stays until the shader warm-up is done (runtime_warm_done), which starts right after the first
+     frame and holds the game until it finishes: the player sees its progress bar, not a black window. Without a
+     warm-up (none started within 3 s) it goes then. */
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(), ^{if(!atomic_load(&warmStarted))bootOverlay.hidden=YES;});
  }
 }
 void runtime_boot_progress(const char *stage,uint64_t done,uint64_t total){
@@ -67,17 +70,21 @@ void runtime_boot_status(const char *stage,const char *detail){
  });
 }
 void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_t shader_total,uint64_t pipelines,uint64_t pipeline_total){
- atomic_store(&warmPending,1);
+ atomic_store(&warmPending,1);atomic_store(&warmStarted,1);(void)shader_total;
  dispatch_async(dispatch_get_main_queue(), ^{
   if(!bootOverlay||bootOverlay.hidden)return;
-  double percent=total ? fmin(100.0,(double)done/(double)total*100.0) : 100.0;
-  bootStage.stringValue=[NSString stringWithFormat:@(TOTK_UI("预热着色器与管线 %.0f%%","Warming shaders and pipelines %.0f%%")),floor(percent)];
-  bootDetail.stringValue=[NSString stringWithFormat:@(TOTK_UI("已处理 %llu/%llu 项 · 着色器 %llu/%llu · 管线 %llu/%llu","%llu/%llu items · shaders %llu/%llu · pipelines %llu/%llu")),
-      (unsigned long long)done,(unsigned long long)total,(unsigned long long)shaders,(unsigned long long)shader_total,
-      (unsigned long long)pipelines,(unsigned long long)pipeline_total];
+  /* The bar follows the pipelines (what the game waits for); the cache top-up after them happens with the game running. */
+  double percent=pipeline_total ? fmin(100.0,(double)pipelines/(double)pipeline_total*100.0) : total ? fmin(100.0,(double)done/(double)total*100.0) : 100.0;
+  bootStage.stringValue=[NSString stringWithFormat:@(TOTK_UI("正在准备图形 %.0f%%","Preparing graphics %.0f%%")),floor(percent)];
+  bootDetail.stringValue=[NSString stringWithFormat:@(TOTK_UI("管线 %llu/%llu · 着色器 %llu","pipelines %llu/%llu · shaders %llu")),
+      (unsigned long long)pipelines,(unsigned long long)pipeline_total,(unsigned long long)shaders];
   bootProgress.indeterminate=NO;
   bootProgress.doubleValue=percent;
  });
+}
+void runtime_warm_ready(void){   /* the startup pipelines are ready and the game goes on: the loading screen goes */
+ atomic_store(&warmPending,0);
+ dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))bootOverlay.hidden=YES;});
 }
 void runtime_warm_done(void){
  atomic_store(&warmPending,0);
