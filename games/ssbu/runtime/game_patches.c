@@ -40,61 +40,37 @@ static void apply_file(Module *m, const char *slug) {
     fclose(f);
     fprintf(stderr, "[ssbu] game patch %s: %u sites\n", slug, applied);
 }
-void runtime_game_patches(Module *main_module) {
-    /* 0x816e0 is a descriptor lookup function called by 17 sites (0x7ca9c - 0x7d294).
-       When a resource is not yet loaded, Horizon Smash 13.0.4 returns NULL (0) at 0x817ec and 0x81a74.
-       However, none of the 17 callers check for NULL before dereferencing offsets +0x38, +0x48, +0x4c, +0x4e.
-       Instead of patching individual call sites (which breaks stack frames or register state),
-       we patch the two NULL-return points in 0x816e0 / 0x81a30 to return a pointer to a zeroed dummy object
-       allocated in main's private writable extra page (0x7a54100).
-       Writes to +0x38 succeed harmlessly, reads of flags/IDs return 0 (not found/none),
-       and no caller crashes or corrupts the stack. */
-    if (!strcmp(main_module->name, "main") && main_module->size >= 0x7a58000) {
-        memset(main_module->base + 0x7a54100, 0, 512);
-
-        // Site A: 0x817ec originally "mov x0, xzr" (0xaa1f03e0)
-        // Branch to trampoline at 0x81834 (unused padding):
-        //   0x81834: adrp x0, 31187       (0xf003ce80) -> page 0x7a54000
-        //   0x81838: add  x0, x0, #0x100  (0x91040000) -> 0x7a54100
-        //   0x8183c: b    0x817f0         (0x17ffffed) -> resume function epilogue
-        uint32_t b_tramp = 0x14000012;
-        uint32_t tramp[] = { 0xf003ce80, 0x91040000, 0x17ffffed };
-        memcpy(main_module->base + 0x817ec, &b_tramp, 4);
-        memcpy(main_module->base + 0x81834, tramp, sizeof(tramp));
-        sys_icache_invalidate(main_module->base + 0x817ec, 4);
-        sys_icache_invalidate(main_module->base + 0x81834, sizeof(tramp));
-
-        // Site B: 0x816e0 tail-call at 0x81830 (originally "b 0x81a30", 0x14000080).
-        // Branch to wrapper at 0x39c7ea0 (executable padding at end of .text):
-        //   0x39c7ea0: stp  x29, x30, [sp, #-16]!  (0xa9bf7bfd)
-        //   0x39c7ea4: mov  x29, sp                (0x910003fd)
-        //   0x39c7ea8: bl   0x81a30                (0x971ae6e2)
-        //   0x39c7eac: cbnz x0, +12                (0xb5000060) -> skip to epilogue if found
-        //   0x39c7eb0: adrp x0, 16525              (0xb0020460) -> page 0x7a54000
-        //   0x39c7eb4: add  x0, x0, #0x100         (0x91040000) -> 0x7a54100 (dummy fallback)
-        //   0x39c7eb8: ldp  x29, x30, [sp], #16    (0xa8c17bfd)
-        //   0x39c7ebc: ret                         (0xd65f03c0)
-        // This preserves 0x81a30 completely unpatched so 0x7f500 can receive NULL and rasterize
-        // new glyphs into the font atlas, while returning the real glyph if found, and safely
-        // returning the dummy object ONLY to 0x816e0 callers when a character is truly missing.
-        uint32_t b_wrapper = 0x14e5199c;
-        uint32_t wrapper[] = {
-            0xa9bf7bfd,
-            0x910003fd,
-            0x971ae6e2,
-            0xb5000060,
-            0xb0020460,
-            0x91040000,
-            0xa8c17bfd,
-            0xd65f03c0
-        };
-        memcpy(main_module->base + 0x81830, &b_wrapper, 4);
-        memcpy(main_module->base + 0x39c7ea0, wrapper, sizeof(wrapper));
-        sys_icache_invalidate(main_module->base + 0x81830, 4);
-        sys_icache_invalidate(main_module->base + 0x39c7ea0, sizeof(wrapper));
-
-        fprintf(stderr, "[ssbu] applied safe glyph lookup wrapper at main+0x81830 -> 0x39c7ea0\n");
+static uint32_t arm64_bl(uint64_t from, uint64_t to) { return 0x94000000u | (uint32_t)(((int64_t)to - (int64_t)from) / 4 & 0x3ffffff); }
+static uint32_t arm64_adrp(uint64_t from, uint64_t page, unsigned rd) {
+    uint32_t imm = (uint32_t)(((int64_t)(page & ~0xfffull) - (int64_t)(from & ~0xfffull)) >> 12) & 0x1fffff;
+    return 0x90000000u | (imm & 3) << 29 | (imm >> 2) << 5 | rd;
+}
+/* Glyph lookup main+0x816e0 (font manager, cp, size, style) returns the glyph's node in the manager's glyph cache, or
+   NULL when the glyph is not registered there yet. 13 of its 17 callers check for NULL and then register the glyph or
+   measure without it; four use the result directly: 0x7ca9c and 0x7cafc (right after registering the same glyph),
+   0x7ccfc and 0x7cdb8. Only those four get a zeroed dummy glyph when the lookup has none (the wrapper at 0x39c7ea0,
+   padding after .text). Before (2026-10-25), every lookup returned the dummy instead
+   of NULL: the checking callers took a missing glyph for a present one and never registered it (about 2,400 lookups
+   found nothing in one pass through the menus), and text was laid out with zero-width glyphs: it overflowed its boxes
+   and icons covered the first letter. */
+static void glyph_lookup_fallback(Module *m) {
+    const uint64_t B = 0x39c7ea0, P = 0x7a54000;
+    uint32_t w[] = { 0xa9bf7bfd, 0x910003fd, arm64_bl(B + 0x08, 0x816e0), 0xb50000c0, arm64_adrp(B + 0x10, P, 0),
+                     0x91400c09, 0x5280002a, 0xb82a013f, 0x91040000, 0xa8c17bfd, 0xd65f03c0 };
+    /* stp x29,x30; mov x29,sp; bl 0x816e0; cbnz x0,ret; adrp x0,page; add x9,x0,#0x3000; mov w10,#1; stadd w10,[x9];
+       add x0,x0,#0x100; ldp x29,x30; ret */
+    static const uint64_t sites[] = { 0x7ca9c, 0x7cafc, 0x7ccfc, 0x7cdb8 };
+    memset(m->base + P, 0, 0x4000);
+    memcpy(m->base + B, w, sizeof w); sys_icache_invalidate(m->base + B, sizeof w);
+    for (size_t i = 0; i < sizeof sites / sizeof *sites; i++) {
+        uint32_t old, want = arm64_bl(sites[i], 0x816e0), bl = arm64_bl(sites[i], B); memcpy(&old, m->base + sites[i], 4);
+        if (old != want) runtime_fail("glyph lookup fallback: call site does not match 13.0.4");
+        memcpy(m->base + sites[i], &bl, 4); sys_icache_invalidate(m->base + sites[i], 4);
     }
+    fprintf(stderr, "[ssbu] glyph lookup: NULL-safe fallback at the 4 unchecked call sites\n");
+}
+void runtime_game_patches(Module *main_module) {
+    if (!strcmp(main_module->name, "main") && main_module->size >= 0x7a58000) glyph_lookup_fallback(main_module);
 
     const char *list = getenv("SSBU_PATCHES");
     if (!list || !*list) { fprintf(stderr, "[ssbu] game patches: none (SSBU_PATCHES)\n"); return; }
