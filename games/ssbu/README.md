@@ -66,17 +66,20 @@ The app runs the game from `SSBU_build`; do not move or delete it while the app 
 
 ### Shaders
 
-Smash's shaders are translated (Switch GPU code to MSL) the first time the game loads them and kept in
-`SSBU_build/build/shader-cache/`. Compile the cache into Metal libraries ahead of time, or the runtime compiles them at
-start-up (slow):
+Smash's shaders are translated (Switch GPU code to MSL) and compiled into Metal libraries. The app keeps them in
+`~/Library/Application Support/MacNativeGames/SSBU/` (`shader-cache/`, `shader-libs/`; `SSBU_CACHE_ROOT` chooses another
+place), shared with any work-folder run. Translate and compile every shader in the game before playing:
 
 ```sh
-python3 scripts/prepare_shader_libs.py --work SSBU_build
+make shaders        # extract_shaders.py -> shader-sweep -> prepare_shader_libs.py; about 6 minutes the first time
 ```
 
-Run it again after playing with new fighters or stages: their shaders are translated during that session, and the first
-appearance of each one hitches once. The very first start after new libraries also waits while macOS builds its own
-shader cache (about a minute); later starts wait a few seconds.
+`extract_shaders.py` reads all 34,054 shaders out of `data.arc` (the `.nushdb` model shaders and every fighter's and
+stage's `.eff` effect shaders), so no fighter or stage hitches the first time it appears. Shaders the game builds from
+other state still translate the first time they are drawn and are kept for next time; run
+`python3 scripts/prepare_shader_libs.py --cache-root ~/Library/Application\ Support/MacNativeGames/SSBU` now and then to
+compile those too. The very first start after new libraries waits while macOS builds its own shader cache (up to a
+minute); later starts wait a few seconds.
 
 ## Start-up
 
@@ -121,6 +124,8 @@ Y Help opens the game's own manual pages over the game; B or Escape goes back an
 | `TOTK_MOVIE_PACE=1` | Host-side movie pacing (TotK's; Smash times its movies itself). |
 | `TOTK_UBO_SNAPSHOT=1` | Copy uniforms at submit (TotK's behaviour; magnifies Smash's 2D screens). |
 | `TOTK_INPUT_LOG=1` | Log each controller id and state the game reads. |
+| `SSBU_CACHE_ROOT=<dir>` | Where the shader cache and libraries live (default: Application Support). |
+| `SSBU_SHADER_DUMP=<dir>` | Write the shaders the game hands over (first `SSBU_SHADER_DUMP_MAX`, default 64), for checks. |
 
 ## Mods
 

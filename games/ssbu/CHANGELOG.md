@@ -1,5 +1,25 @@
 # Super Smash Bros. Ultimate port: work log
 
+## 2026-10-26 — shaders ahead of play, cache out of the app, scaled copies
+
+- **Every shader before play:** `make shaders`. `scripts/extract_shaders.py` reads all 34,054 shaders from `data.arc`:
+  - the `.nushdb` model shaders, where each control section is followed by its code;
+  - the `.eff` effect shaders, inside NintendoWare BNSH containers, paired through their 24-byte
+    {control, code, sizes} records.
+
+  The pack holds exactly the bytes the game hands over: 13,734 of the 14,139 shaders a session had used are in it with
+  the same keys, and the rest are built into `main`. The runtime's `shader-sweep` mode translates the pack (20,320 new,
+  69 s) and `prepare_shader_libs.py` compiles it (13,266 libraries). A fighter or stage met for the first time no longer
+  hitches 1.5–3 s.
+- **Shader cache moved:** the cache and libraries live in Application Support (`SSBU_CACHE_ROOT`), not inside the app
+  bundle, where play wrote into the signed app. The first start clones the old cache there; the app and work-folder
+  runs share it.
+- **Scaled texture copies:** copies that change size, mirror or format run as a render pass. Smash halves its depth-stencil
+  buffer for its half-resolution effects; that copy was skipped. `probe-gpu-scaled-copy` checks every pixel of depth,
+  depth-stencil, nearest, linear and mirrored copies.
+- **Scissor warning:** the second scissor set at start (Labo VR stereo halves) is unused, since no shader selects a
+  viewport index; its log line no longer reads as an error.
+
 ## 2026-10-25 — first boot to offline play
 
 ### Boot

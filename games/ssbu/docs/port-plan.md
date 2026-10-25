@@ -87,13 +87,13 @@ All of it runs on the internal disk; copy inputs off external drives first (work
 
 ## Open problems
 
-1. **First appearance of new shaders.** A fighter or stage met for the first time hitches once (1.5–3 s in total) while its
-   shaders translate; `prepare_shader_libs.py` afterwards makes it smooth. A shader inventory built from `data.arc` ahead
-   of play would remove the first hitch.
-2. **Shader cache inside the app bundle.** The bundled game folder holds the translation cache and libraries, so play
-   writes into the signed bundle. Move them to Application Support.
-3. **Start-up time.** The loading screen waits 2.5–9.5 s for about 7,000 pipelines; loading 14,000 separate libraries
-   dominates. A Metal binary archive could cut it.
+1. **Pipelines met for the first time.** `make shaders` translates and compiles every shader in `data.arc` ahead of play
+   (2026-10-26), but a new combination of shaders and render state still builds its Metal pipeline at its first draw
+   (tens of ms each); it is recorded and built at the next start.
+2. **Start-up time.** The loading screen waits 3–9 s for about 8,000 pipelines, and the background top-up then loads
+   about 36,000 libraries (about 35 s on two low-priority threads). A Metal binary archive could cut both.
+3. **Old cache in the app bundle.** Since 2026-10-26 the cache lives in Application Support; a bundle copied before then
+   still carries its old `build/shader-cache` (unused, APFS-cloned, harmless).
 4. **Rare boot crash** in `movie::Buffer::Base` (`subsdk0+0x23b40`), seen once before the movie-pacing fix; not seen since.
 5. **Unverified:** the ZR side-menu highlight, a white wedge on the Smash submenu, the player-lamp icon with two
    controllers, and on-screen keyboard navigation on every controller type.
@@ -109,7 +109,9 @@ from such runs are not representative; use a run from the player's own foregroun
 - **M1–M3 (2026-10-25):** ExeFS rewrite, `make prepare` / `make runtime`, first boot, NRO modules loaded.
 - **M4 (2026-10-25):** title and menus with picture and sound, correct text and UI masks.
 - **M5 (2026-10-25):** offline matches; multiple controllers, saves, 60 Hz, DLC, manual, text entry.
-- **Next:** shader inventory ahead of play, cache out of the bundle, faster start, then 13.0.5.
+- **2026-10-26:** every shader translated ahead of play (`make shaders`), shader cache in Application Support, scaled
+  texture copies.
+- **Next:** faster start (binary archive), then 13.0.5.
 
 ## Licensing and provenance
 
