@@ -766,11 +766,13 @@ static uint64_t output_floats(unsigned screen, unsigned render) {
     float a = (float)screen, b = (float)render; uint32_t x, y; memcpy(&x, &a, 4); memcpy(&y, &b, 4);
     return x | ((uint64_t)y << 32);
 }
+static _Atomic int g_scene_720 = -1;   /* the 1080p canvas draws its scene at 1280x720: TOTK_RENDER_RES=720 at the start, then the picture mode */
+static int scene_720(void) { int v = atomic_load(&g_scene_720); if (v < 0) { v = render_720(); atomic_store(&g_scene_720, v); } return v; }
 static void output_page(unsigned w, unsigned h) {   /* what the docked branch writes from its next run on */
     const char *e = getenv("TOTK_RENDER_RES");
     unsigned render = w;   /* the shipped 1600x900 or a 1280x720 scene, at the 1080p canvas only */
     if (w == 1920 && h == 1080 && e && !strcmp(e, "900")) render = 1600;
-    if (w == 1920 && h == 1080 && render_720()) render = 1280;
+    if (w == 1920 && h == 1080 && scene_720()) render = 1280;
     { static unsigned told; if (render != w && told != render) { told = render; fprintf(stderr, "[botw] scene %ux%u under the %ux%u canvas (TOTK_RENDER_RES=%s)\n", render, render * h / w, w, h, e); } }
     atomic_store(&g_out_page[0], output_floats(w, render));
     atomic_store(&g_out_page[1], w | ((uint64_t)h << 32));
@@ -899,7 +901,7 @@ int runtime_output_native(int mode, unsigned *w, unsigned *h) {
 }
 int runtime_output_modes(void) {
     unsigned w, h;
-    return 1 << OUTPUT_MODE_OFF | 1 << OUTPUT_MODE_METALFX | (output_switchable() ? 1 << OUTPUT_MODE_720P : 0) |
+    return 1 << OUTPUT_MODE_OFF | 1 << OUTPUT_MODE_METALFX | (output_switchable() ? 1 << OUTPUT_MODE_720P | 1 << OUTPUT_MODE_720P_METALFX : 0) |
            (runtime_output_native(OUTPUT_MODE_NATIVE, &w, &h) ? 1 << OUTPUT_MODE_NATIVE | 1 << OUTPUT_MODE_NATIVE_METALFX : 0);
 }
 int runtime_output_mode(void) {
@@ -908,24 +910,30 @@ int runtime_output_mode(void) {
         unsigned w = output_width_now();
         if (w == 1280) return OUTPUT_MODE_720P;
         if (w > 1920) return mfxup_enabled() ? OUTPUT_MODE_NATIVE_METALFX : OUTPUT_MODE_NATIVE;
+#ifdef GAME_BOTW160
+        if (scene_720() && mfxup_enabled()) return OUTPUT_MODE_720P_METALFX;
+#endif
     }
     return mfxup_enabled() ? OUTPUT_MODE_METALFX : OUTPUT_MODE_OFF;
 }
 int runtime_output_mode_set(int mode) {
     extern void dm_gfx_set_flag(const char *name, int value);
-    if (mode < OUTPUT_MODE_OFF || mode > OUTPUT_MODE_720P || !(runtime_output_modes() & 1 << mode)) return 0;
-    int mfx = mode == OUTPUT_MODE_METALFX || mode == OUTPUT_MODE_NATIVE_METALFX;   /* 2K + MetalFX: the output stage scales the 2K canvas to the window */
+    if (mode < OUTPUT_MODE_OFF || mode > OUTPUT_MODE_720P_METALFX || !(runtime_output_modes() & 1 << mode)) return 0;
+    /* 2K + MetalFX: the output stage scales the 2K canvas to the window; 720p + MetalFX: MetalFX upscales the 720p scene into the 1080p canvas */
+    int mfx = mode == OUTPUT_MODE_METALFX || mode == OUTPUT_MODE_NATIVE_METALFX || mode == OUTPUT_MODE_720P_METALFX;
     dm_gfx_set_flag("mfx_output", mfx);
     dm_gfx_set_flag("mfx_upscale", mfx);
 #ifdef GAME_BOTW160
     if (output_switchable()) {
         unsigned w = 1920, h = 1080;
         if (mode == OUTPUT_MODE_720P) { w = 1280; h = 720; } else if (mode == OUTPUT_MODE_NATIVE || mode == OUTPUT_MODE_NATIVE_METALFX) { w = g_out_w; h = g_out_h; }
-        if (output_width_now() != w) output_switch(w, h);
+        int scene = mode == OUTPUT_MODE_720P_METALFX, was = scene_720();
+        atomic_store(&g_scene_720, scene);
+        if (output_width_now() != w || (w == 1920 && scene != was)) output_switch(w, h);   /* same canvas, other scene size: the display mode applies it again */
     }
 #endif
     fprintf(stderr, "[botw] picture: %s\n", mode == OUTPUT_MODE_NATIVE ? "native 2K" : mode == OUTPUT_MODE_NATIVE_METALFX ? "native 2K, MetalFX to the window" : mode == OUTPUT_MODE_720P ? "720p" :
-            mode == OUTPUT_MODE_METALFX ? "MetalFX 2K" : "off (1080p)");
+            mode == OUTPUT_MODE_720P_METALFX ? "720p scene, MetalFX to the 1080p canvas" : mode == OUTPUT_MODE_METALFX ? "MetalFX 2K" : "off (1080p)");
     return 1;
 }
 /* Key 4 (runtime/input.c): ultrawide on / off (TOTK_ASPECT, default 21:9; also 32:9, 3440x1440 or 2.39; TOTK_ASPECT set
