@@ -365,12 +365,15 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  case 0x06: {
   uint64_t addr=r[2],base=addr&~0xfffULL,size=0x1000;unsigned state=0,perm=0,attr=0;
   uintptr_t top=(uintptr_t)pthread_get_stackaddr_np(pthread_self());size_t stack=pthread_get_stacksize_np(pthread_self());
-  if(addr>=top-stack&&addr<top){base=top-stack;size=stack;state=0xb;perm=3;}
+  /* loaded modules first: macOS maps NRO images anywhere, also between the low space and the alias space, which used to
+     answer "host-owned, inaccessible" there; the guest unwinder then found no code for a fighter module (Kazuya) and an
+     exception thrown through it ended the game (2026-10-26) */
+  if(runtime_module_query(addr,&base,&size,&state,&perm,&attr)){}
+  else if(addr>=top-stack&&addr<top){base=top-stack;size=stack;state=0xb;perm=3;}
   else if(addr>=(uintptr_t)heap&&addr<(uintptr_t)heap+heap_size){base=(uintptr_t)heap;size=heap_size;state=5;perm=3;}
   else if(addr>=(uintptr_t)low_space&&addr<(uintptr_t)low_space+LOW_SIZE){base=(uintptr_t)low_space;size=LOW_SIZE;if(addr<(uintptr_t)heap){size=(uintptr_t)heap-base;}else{base=(uintptr_t)heap+heap_size;size=(uintptr_t)low_space+LOW_SIZE-base;}}
   else if(addr>=(uintptr_t)low_space+LOW_SIZE&&addr<ALIAS_START){base=(uintptr_t)low_space+LOW_SIZE;size=ALIAS_START-base;state=0x10;perm=0;}   /* host-owned: Inaccessible */
   else if(!addr){base=0;size=ASLR_START;state=0;perm=0;}
-  else if(runtime_module_query(addr,&base,&size,&state,&perm,&attr)){}
   else {state=0;perm=0;}
   pthread_mutex_lock(&memory_lock);
   if(addr>=ALIAS_START&&addr<ALIAS_START+ALIAS_SIZE){
