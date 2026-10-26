@@ -5152,7 +5152,8 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
         NSString *variant=totk_rt_variant(@(key),st,control,(const uint8_t *)(uintptr_t)p->sd[i].data,rt_answers(st),rt_local(control,st));
         if(!variant){o->missing|=1<<st;o->ctl[st]=control;o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data;o->key[st]=@(key);continue;}   // iOS: not translated yet, its draws are skipped
         NvShader *sh=shader_get([variant stringByAppendingString:@"_b"],st);
-        if(!sh)MDIE("TOTK shader translation/reflection unavailable for %s",variant.UTF8String);
+        if(!sh){MLOG("【红】shader %s does not compile on Metal: the draws that use it are skipped",variant.UTF8String);   // was the end of the game
+            o->missing|=1<<st;o->ctl[st]=control;o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data;o->key[st]=@(key);continue;}
         o->sh[st]=sh; o->ctl[st]=control; o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data; o->key[st]=@(key);
         o->sig[st]=stage_sig(st); o->alt[st]=[NSMutableDictionary dictionaryWithObject:sh forKey:@(o->sig[st])];
     }
@@ -5916,7 +5917,7 @@ static int prog_fit(NvProg *pr) {
             NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), nil);
             if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; return -1; }   // iOS: this signature's variant is not translated yet
             v = shader_get([variant stringByAppendingString:@"_b"], st);
-            if (!v) MDIE("TOTK shader translation/reflection unavailable for %s", variant.UTF8String);
+            if (!v) { MLOG("【红】shader %s does not compile on Metal: the draws that use it are skipped", variant.UTF8String); pr->miss_sig[st] = sg; pr->miss_has[st] = 1; return -1; }
             pr->alt[st][@(sg)] = v;
         }
         if (v != pr->sh[st]) changed = 1;

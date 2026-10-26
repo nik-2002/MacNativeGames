@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <sys/clonefile.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -43,7 +44,7 @@ static Mount mounts[16];
 static File files[NFILES];
 static Dir dirs[NDIRS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static char profile[1024], save_root[1024];
+static char profile[1024], save_root[1024], save_base[1100];
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }
@@ -52,7 +53,37 @@ static void need(int c, const char *m) { if (!c) runtime_fail(m); }
    writes a slot's files back to back and then commits; between the files nothing is open for a moment). */
 static _Atomic int save_writers, save_dirty;
 static _Atomic uint64_t save_changed_ns;
-static void save_touched(void) { atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1); }
+/* Save journal, as the console's save data has one: writes that are not committed do not survive the game ending. Before
+   the first change after a commit, the committed save is cloned beside it (<save>.committed, an APFS clone: no space until
+   files change); Commit drops the clone. A start that finds the clone means the last session ended in the middle of a
+   save (a crash, a forced quit): the save goes back to the committed one, and the half-written one is kept once as
+   <save>.interrupted. */
+static pthread_mutex_t journal_lock = PTHREAD_MUTEX_INITIALIZER;
+static int journal_state;   /* 0: none, 1: the committed save is cloned, -1: cloning failed (no journal this session) */
+static int remove_tree(const char *path);
+static void journal_begin(void) {
+    pthread_mutex_lock(&journal_lock);
+    if (!journal_state && save_base[0]) {
+        remove_tree(save_base);
+        if (!clonefile(save_root, save_base, 0)) journal_state = 1;
+        else { journal_state = -1; fprintf(stderr, "[ssbu] 【红】save journal: cannot clone %s (%s); saves are written without one\n", save_root, strerror(errno)); }
+    }
+    pthread_mutex_unlock(&journal_lock);
+}
+static void journal_commit(void) {
+    pthread_mutex_lock(&journal_lock);
+    if (journal_state == 1) { remove_tree(save_base); journal_state = 0; fprintf(stderr, "[ssbu] save committed\n"); }
+    pthread_mutex_unlock(&journal_lock);
+}
+static void journal_recover(void) {
+    struct stat st;
+    if (stat(save_base, &st) || !S_ISDIR(st.st_mode)) return;
+    char aside[1200]; snprintf(aside, sizeof aside, "%s.interrupted", save_root);
+    remove_tree(aside);
+    if (rename(save_root, aside) || rename(save_base, save_root)) runtime_fail("save journal: restoring the committed save");
+    fprintf(stderr, "[ssbu] 【红】the last session ended in the middle of a save: the save is back to its last commit (the unfinished one is %s)\n", aside);
+}
+static void save_touched(void) { journal_begin(); atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1); }
 int runtime_fs_save_busy(void) {
     if (atomic_load(&save_writers) > 0) return 1;
     return atomic_load(&save_dirty) && runtime_now_ns() - atomic_load(&save_changed_ns) < 3000000000ull;
@@ -76,6 +107,8 @@ static void init(void) {
     char p[1100]; make_dir(profile);
     snprintf(p, sizeof p, "%s/save", profile); make_dir(p);
     need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", profile, (unsigned long long)uid[1], (unsigned long long)uid[0]) < (int)sizeof save_root, "save path");
+    need(snprintf(save_base, sizeof save_base, "%s.committed", save_root) < (int)sizeof save_base, "save journal path");
+    journal_recover();
     make_dir(save_root);                                   /* launcher-style EnsureSaveData */
     snprintf(p, sizeof p, "%s/temp", profile); remove_tree(p); make_dir(p);
     snprintf(p, sizeof p, "%s/cache", profile); make_dir(p);
@@ -188,6 +221,7 @@ static unsigned commit(const char *name) {
     pthread_mutex_unlock(&lock);
     if (!found) return R_PATH_NOT_FOUND;
     for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) fcntl(fd, F_FULLFSYNC); }
+    if (save) journal_commit();
     if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) atomic_store(&save_dirty, 0);   /* 23: probe-save's negative control */
     return 0;
 }
@@ -395,9 +429,23 @@ void runtime_save_probe(void) {
     CHECK(create_file("temp:/t.bin", 4) == 0 && !runtime_fs_save_busy(), "temporary storage does not count");
     CHECK(rename_file("save:/b.sav", "save:/c.sav") == 0 && runtime_fs_save_busy(), "renaming save data");
     CHECK(commit("save") == 0 && !runtime_fs_save_busy() && delete_file("save:/c.sav") == 0 && runtime_fs_save_busy() && commit("save") == 0, "delete and commit");
+    /* the journal: a session that ends between a change and its commit starts again from the committed save */
+    struct stat st; char b2[1200]; snprintf(b2, sizeof b2, "%s/x.sav", save_root);
+    CHECK(stat(save_base, &st) != 0, "no committed copy kept after a commit");
+    CHECK(open_file(&h, "save:/a.sav", OPEN_WRITE) == 0 && stat(save_base, &st) == 0, "the first change clones the committed save");
+    static const char torn[16] = "half-written";
+    CHECK(write_file(h, 0, torn, sizeof torn, NULL) == 0 && create_file("save:/x.sav", 4) == 0, "uncommitted writes");
+    close_file(h);
+    journal_state = 0; atomic_store(&save_writers, 0); journal_recover();   /* the next start */
+    { char a2[1200]; snprintf(a2, sizeof a2, "%s/a.sav", save_root); FILE *f = fopen(a2, "rb"); char got[16] = {0}; if (f) { fread(got, 1, sizeof got, f); fclose(f); }
+      CHECK(!memcmp(got, data, sizeof data), "the committed contents are back"); }
+    CHECK(stat(b2, &st) != 0 && stat(save_base, &st) != 0, "the uncommitted file is gone, and the clone with it");
+    { char aside[1200]; snprintf(aside, sizeof aside, "%s.interrupted", save_root); CHECK(stat(aside, &st) == 0, "the unfinished save is kept aside"); }
+    CHECK(open_file(&h, "save:/a.sav", OPEN_WRITE) == 0, "a change after recovery");
+    close_file(h); CHECK(commit("save") == 0 && stat(save_base, &st) != 0, "and its commit");
 #undef CHECK
     remove_tree(dir);
-    printf("{\"status\":\"pass\",\"probe\":\"probe-save\",\"checks\":%u,\"scope\":\"save-in-progress state (runtime_fs_save_busy) through open / write / close / create / rename / delete / commit on a save mount; reads and temporary storage do not count; stale uncommitted changes do not hold a close\"}\n", checks);
+    printf("{\"status\":\"pass\",\"probe\":\"probe-save\",\"checks\":%u,\"scope\":\"save-in-progress state (runtime_fs_save_busy) through open / write / close / create / rename / delete / commit on a save mount; reads and temporary storage do not count; stale uncommitted changes do not hold a close; the journal restores the committed save after a session that ended mid-save\"}\n", checks);
 }
 
 static void set_allocator(void *alloc, void *dealloc) { (void)alloc; (void)dealloc; }

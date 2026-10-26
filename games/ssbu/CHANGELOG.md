@@ -1,5 +1,41 @@
 # Super Smash Bros. Ultimate port: work log
 
+## 2026-10-26 — crashes, saves, Help pages, controllers
+
+### Crashes
+
+- **Menu clips:** a looping clip (Help > Techniques, menu previews) overflowed the decoder's input queues when it
+  rewound, and the queued times overwrote the frame pointers: a crash some minutes into the menus. The queues are bounded,
+  a rewind keeps the buffers the game holds and the decoder's pictures, and the clip's first key frame is decoded again
+  when a loop resumes at its second frame. Loops went from hundreds of VP9 errors each to none.
+- **Kazuya:** macOS can map a fighter's script module between the low space and the alias space, a range memory queries
+  answered as host-owned. The game's unwinder then found no code there, and an exception thrown through Kazuya's scripts
+  ended the game. Loaded modules are asked first.
+- **Graphics:** an NVN function the port lacks (83 of 523: debug, GL interop, transform feedback, tessellation, getters)
+  is logged once and returns 0 instead of ending the game (`DM_NVN_STRICT=1`: stop). Integer clears (`ClearColori`,
+  `ClearColorui`, `ClearTexturei`) are implemented.
+- **Shaders:** a shader that fails to translate, a translator that exits, or a translation Metal cannot compile skips the
+  draws that need it instead of ending the game; a new translator starts for the next shader. A dead translator's pipe no
+  longer raises SIGPIPE (which ended the game without a log).
+
+### Saves
+
+- **Journal:** writes that are not committed no longer survive the game ending, as on the console. Before the first change
+  after a commit the committed save is cloned beside it (an APFS clone, no space until files change); Commit drops the
+  clone. A start that finds one restores the committed save and keeps the unfinished one once as `<save>.interrupted`.
+  `probe-save` covers it (23 checks).
+
+### Help pages
+
+- How to Play, Mode Guide and Move List open (the NX browser's Gamepad API, first-paint event, font event and focus are
+  stood in for); D-pad navigation moves to the item in line; no focus ring; the Switch font is the page default and
+  button glyphs render. Y Help fades to black at once and its web process is started ahead.
+
+### Controllers
+
+- Controllers keep playing while another app is in front (`SSBU_BACKGROUND_PADS=0`: frontmost only), are read on their
+  own queue, keep their player on reconnect, use a round dead zone, and simple pads (a single Joy-Con) work.
+
 ## 2026-10-26 — shaders ahead of play, cache out of the app, scaled copies
 
 - **Every shader before play:** `make shaders`. `scripts/extract_shaders.py` reads all 34,054 shaders from `data.arc`:

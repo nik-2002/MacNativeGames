@@ -14,6 +14,8 @@
 #include <mach-o/dyld.h>
 #include <pthread.h>
 #include <spawn.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -143,12 +145,28 @@ static void service_spawn(FILE **pin, FILE **pout) {
     }
     posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&sa);
     close(to[0]); close(from[1]);
+    fcntl(to[1], F_SETNOSIGPIPE, 1);   /* a translator that died: the write fails instead of SIGPIPE ending the game */
     *pin = fdopen(to[1], "w"); *pout = fdopen(from[0], "r");
     if (!*pin || !*pout) die("shader service streams");
     LOG("[shader] runtime translation service started (pid %d, %s), cache %s", pid,
         use_native ? "native build/shader-service/totk_xlate" : "python3 scripts/shader_service.py + .NET", totk_rt_dir().UTF8String);
 }
 static void service_start(void) { service_spawn(&g_svc_in, &g_svc_out); }
+/* A translator that exited: its streams are closed and the next request starts a new one. */
+static void service_drop(FILE **pin, FILE **pout) {
+    if (*pin) fclose(*pin);
+    if (*pout) fclose(*pout);
+    *pin = *pout = NULL;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+}
+/* A shader the game draws with that cannot be translated no longer ends the game: the draws that need it are skipped
+   (the same path as a missing variant on the phone), and the reason is logged once per shader. */
+static NSString *rt_give_up(NSString *what, NSString *why) {
+    static NSMutableSet<NSString *> *told; static dispatch_once_t once; dispatch_once(&once, ^{ told = [NSMutableSet set]; });
+    BOOL first; @synchronized (told) { first = ![told containsObject:what]; if (first) [told addObject:what]; }
+    if (first) { LOG("【红】[shader] %s: %s; the draws that use it are skipped", what.UTF8String, why.UTF8String); }
+    return nil;
+}
 
 static NSString *hex(const uint8_t *p, size_t n) {
     NSMutableString *s = [NSMutableString stringWithCapacity:n * 2];
@@ -215,15 +233,19 @@ static NSString *rt_variant(NSString *shader, int stage, const uint8_t *control,
         return found;
     }
     uint32_t c1o, c1t; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4);
-    if (!c1t || c1t > 16u << 20 || c1o > c1t || (stage != 5 && c1o < 0x30)) die("shader %s: code area %#x / c1 %#x", shader.UTF8String, c1t, c1o);
+    if (!c1t || c1t > 16u << 20 || c1o > c1t || (stage != 5 && c1o < 0x30)) {
+        pthread_mutex_unlock(&g_rt_lock); return rt_give_up(shader, [NSString stringWithFormat:@"code area %#x / c1 %#x", c1t, c1o]);
+    }
     NSString *stage_name = stage == 0 ? @"vs" : stage == 1 ? @"ps" : stage == 5 ? @"cs" : nil;
-    if (!stage_name) die("shader %s: NVN stage %d has no translation chain (tessellation/geometry)", shader.UTF8String, stage);
+    if (!stage_name) { pthread_mutex_unlock(&g_rt_lock); return rt_give_up(shader, [NSString stringWithFormat:@"NVN stage %d has no translation chain (tessellation/geometry)", stage]); }
     uint8_t md[32]; NSData *ad = [json_string(answers) dataUsingEncoding:NSUTF8StringEncoding]; CC_SHA256(ad.bytes, (CC_LONG)ad.length, md);
     NSString *variant = [NSString stringWithFormat:@"%@-%@", shader, hex(md, 6)];
     NSString *code_path = [ssbu_rt_dir() stringByAppendingFormat:@"/%@.code", variant];
     // Graphics code drops the 0x30-byte NVN header (the translator wants SPH + instructions); compute keeps it, as in D2R's build.
     size_t skip = stage == 5 ? 0 : 0x30;
-    if (![[NSData dataWithBytes:code + skip length:c1t - skip] writeToFile:code_path atomically:YES]) die("write shader code %s", code_path.UTF8String);
+    if (![[NSData dataWithBytes:code + skip length:c1t - skip] writeToFile:code_path atomically:YES]) {
+        pthread_mutex_unlock(&g_rt_lock); return rt_give_up(variant, [@"cannot write " stringByAppendingString:code_path]);
+    }
     NSMutableDictionary *rq = [NSMutableDictionary dictionaryWithDictionary:@{@"variant": variant, @"stage": stage_name, @"code": code_path, @"c1": hex(code + c1o, c1t - c1o)}];
     [rq addEntriesFromDictionary:answers];
     if (local) rq[@"local"] = local;
@@ -254,18 +276,23 @@ static NSString *rt_variant(NSString *shader, int stage, const uint8_t *control,
     fprintf(sin, "%s\n", json_string(rq).UTF8String); fflush(sin);
     char line[2048]; int got = fgets(line, sizeof line, sout) != NULL;
     if (quiet) pthread_mutex_lock(&g_rt_lock);
-    if (!got) { if (quiet) { pthread_mutex_unlock(&g_rt_lock); return nil; } die("shader service exited while translating %s", variant.UTF8String); }
+    if (!got) {
+        if (quiet) { service_drop(&g_pf_in, &g_pf_out); pthread_mutex_unlock(&g_rt_lock); return nil; }
+        service_drop(&g_svc_in, &g_svc_out); pthread_mutex_unlock(&g_rt_lock);
+        return rt_give_up(variant, @"the translator exited while translating it (a new one starts for the next shader)");
+    }
     NSDictionary *reply = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:line length:strlen(line)] options:0 error:nil];
     if (![reply[@"ok"] boolValue]) {
         if (quiet) { pthread_mutex_unlock(&g_rt_lock); return nil; }
         LOG("[survey-shader] frame %llu translation FAILED %s %s after %.2f ms: %s",
             (unsigned long long)dm_nvn_frame_count(), stage_name.UTF8String, variant.UTF8String,
             (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6, [[reply[@"error"] description] UTF8String]);
-        die("shader %s (%s) translation failed: %s", variant.UTF8String, stage_name.UTF8String, [[reply[@"error"] description] UTF8String]);
+        pthread_mutex_unlock(&g_rt_lock);
+        return rt_give_up(variant, [NSString stringWithFormat:@"%@ translation failed: %@", stage_name, [reply[@"error"] description]]);
     }
     NSData *jd = [NSData dataWithContentsOfFile:[ssbu_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];
     NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
-    if (![refl isKindOfClass:[NSDictionary class]]) { if (quiet) { pthread_mutex_unlock(&g_rt_lock); return nil; } die("shader %s: reflection missing", variant.UTF8String); }
+    if (![refl isKindOfClass:[NSDictionary class]]) { pthread_mutex_unlock(&g_rt_lock); return quiet ? nil : rt_give_up(variant, @"reflection missing"); }
     [vs addObject:@{@"variant": variant, @"deps": refl[@"deps"] ?: @{}}];
     [g_msl_checked addObject:variant];
     [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];

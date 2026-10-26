@@ -127,6 +127,7 @@ Y Help opens the game's own manual pages over the game; B or Escape goes back an
 | `SSBU_DLC=0` | Report no add-ons. |
 | `SSBU_MERGE_PADS=1` | All controllers drive player 1. |
 | `SSBU_BACKGROUND_PADS=0` | Controllers play only while the game is the frontmost app. |
+| `DM_NVN_STRICT=1` | Stop at the first graphics call the port does not implement (otherwise logged once and skipped). |
 | `SSBU_WARM_BEFORE_START=0` | Start the game after the title shaders only (the old, stuttery order). |
 | `SSBU_SHADER_PREFETCH=0` | Do not translate shaders when the game loads them. |
 | `TOTK_RUMBLE=0` / `TOTK_GYRO=0` | No rumble / no motion sensor. |

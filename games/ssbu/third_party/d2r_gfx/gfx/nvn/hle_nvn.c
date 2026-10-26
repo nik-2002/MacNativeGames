@@ -64,10 +64,15 @@ void *nvn_real[NVN_NFUNC];               // DM_NVN_PROF：计时包装调用的�
 _Atomic uint64_t nvn_prof_ticks[NVN_NFUNC]; // DM_NVN_PROF：各函数累计耗时（cntvct 计数） | DM_NVN_PROF: cumulative time of each function (cntvct counts)
 static uint8_t g_unimpl_seen[NVN_NFUNC];
 
+/* An NVN function the port does not implement (debug, GL interop, transform feedback, tessellation, builder getters...).
+   It is logged once and returns 0, so a mode that touches one shows at worst a missing effect instead of ending the
+   game; DM_NVN_STRICT=1 stops at the first call (finding what to implement). */
 uint64_t nvn_unimpl_c(nvn_slot_t *slot, uint64_t x0, uint64_t x1, uint64_t x2) {
     unsigned i = (unsigned)(slot - nvn_slot);
-    if (!g_unimpl_seen[i]++) LOG("【红】NVN 未实现被调用：%s (x0=%#llx x1=%#llx x2=%#llx)", nvn_names[i], x0, x1, x2);
-    die("unimplemented NVN call %s",nvn_names[i]);
+    if (!g_unimpl_seen[i]) { g_unimpl_seen[i] = 1; LOG("【红】NVN 未实现被调用：%s (x0=%#llx x1=%#llx x2=%#llx)，返回 0 继续 | unimplemented NVN call %s: returns 0", nvn_names[i], x0, x1, x2, nvn_names[i]); }
+    static int strict = -1; if (strict < 0) { const char *e = getenv("DM_NVN_STRICT"); strict = e && atoi(e); }
+    if (strict) die("unimplemented NVN call %s", nvn_names[i]);
+    return 0;
 }
 
 #include "nvn_impl.h"
@@ -1544,6 +1549,14 @@ NVN(nvnCommandBufferClearColor, void, NVNcommandBuffer *c, int index, const floa
     p_clear_color *r = REC(c, OP_CLEAR_COLOR, p_clear_color); r->index = index; r->mask = mask; memcpy(r->rgba, rgba, 16);
     if (cmdlog_on()) LOG("[cmd] F%llu ClearColor %d rgba=%g,%g,%g,%g mask=%#x", (unsigned long long)g_frame_pub, index, rgba[0], rgba[1], rgba[2], rgba[3], mask);
 }
+/* Integer render targets: Metal clears them from a colour value converted to the target's format, exact for the
+   values a game clears with (|v| < 2^24). */
+NVN(nvnCommandBufferClearColori, void, NVNcommandBuffer *c, int index, const int *v, int mask) {
+    const float f[4] = {(float)v[0], (float)v[1], (float)v[2], (float)v[3]}; h_nvnCommandBufferClearColor(c, index, f, mask);
+}
+NVN(nvnCommandBufferClearColorui, void, NVNcommandBuffer *c, int index, const uint32_t *v, int mask) {
+    const float f[4] = {(float)v[0], (float)v[1], (float)v[2], (float)v[3]}; h_nvnCommandBufferClearColor(c, index, f, mask);
+}
 NVN(nvnCommandBufferClearDepthStencil, void, NVNcommandBuffer *c, float depth, uint32_t dmask, int stencil, int smask) {
     if (cmdlog_on()) LOG("[cmd] F%llu ClearDepthStencil depth=%g dmask=%u stencil=%d smask=%#x", (unsigned long long)g_frame_pub, depth, dmask, stencil, smask);
     p_clear_ds *r = REC(c, OP_CLEAR_DS, p_clear_ds); *r = (p_clear_ds){depth, (int)B(dmask), stencil, smask};
@@ -2085,6 +2098,9 @@ NVN(nvnCommandBufferClearTexture, void, NVNcommandBuffer *c, const NVNtexture *t
 }
 NVN(nvnCommandBufferClearTextureui, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const uint32_t *rgba, int mask) {
     p_clear_tex *o = REC(c, OP_CLEAR_TEX, p_clear_tex); o->tex = tex_pin(t); copy_view(&o->view, &o->has_view, v); o->r = *r; o->mask = mask; o->is_uint = 1; memcpy(o->c.u, rgba, 16);
+}
+NVN(nvnCommandBufferClearTexturei, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const int *rgba, int mask) {
+    uint32_t bits[4]; memcpy(bits, rgba, 16); h_nvnCommandBufferClearTextureui(c, t, v, r, bits, mask);   /* the integer path writes the bits as they are */
 }
 NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNtexture *s, const NVNtextureView *sv, const NVNcopyRegion *sr,
     const NVNtexture *d, const NVNtextureView *dv, const NVNcopyRegion *dr, int flags) {
