@@ -22,7 +22,7 @@ static void botw_aspect_apply(void);
    patches on the Mac, and the patched text and patch area are embedded in the app (ios/tools/gen_embed.py), as for
    Tears of the Kingdom (game_patches.c). On the device the original words are not checked (they are patched already) and
    each patched word is checked instead of written. The switches that leave a patch out (TOTK_REALTIME=0,
-   TOTK_PAD_REPEAT=0, TOTK_SLINK_REALTIME=0, TOTK_RENDER_RES=900, TOTK_EXCL_ACQUIRE=0), the brk diagnostics (TOTK_PAD_LOG, TOTK_JQ_CHECK) and the
+   TOTK_PAD_REPEAT=0, TOTK_SLINK_REALTIME=0, TOTK_RENDER_RES=900 / 720, TOTK_EXCL_ACQUIRE=0), the brk diagnostics (TOTK_PAD_LOG, TOTK_JQ_CHECK) and the
    native output size (TOTK_OUTPUT_RES) are Mac only; the export ignores them too, so the device checks what it made. */
 #if TARGET_OS_IPHONE
 #define CODE_PATCHED_AT_BUILD 1
@@ -526,12 +526,17 @@ static unsigned excl_acquire(uint8_t *code, size_t n, int write) {   /* write 0:
    main+0x1821674 movk x8, #0x44c8, lsl #48 (1600.0) -> movk x8, #0x44f0, lsl #48 (1920.0).
    1.9.0's display-mode routine is main+0x1266074 (a jump on the mode byte +0x11be; docked and mode 2 store the same pair
    to +0x1210 / +0x1214 and crop 1920x1080; handheld stores 1280.0 / 1280.0 and is left as shipped):
-   main+0x12660c8 movk x8, #0x44c8, lsl #48 -> movk x8, #0x44f0, lsl #48. */
+   main+0x12660c8 movk x8, #0x44c8, lsl #48 -> movk x8, #0x44f0, lsl #48.
+   TOTK_RENDER_RES=720 draws the scene at 1280x720 under the same 1080p canvas (render width 1280.0, as the phone's
+   960.0 under its 1280.0 screen): a third of the scene's pixels, the UI still at 1080p, and the game's upscale into the
+   canvas is what MetalFX replaces (TOTK_MFX_UPSCALE=1 or the settings panel's MetalFX; nvn_mtl.m mfxup_dock reads the
+   region from the upscale's constants, so it takes any scene size below the canvas). movk x8, #0x44a0, lsl #48. */
 #ifdef GAME_BOTW160
 enum { RENDER_MOVK = 0x1821674 };
 #else
 enum { RENDER_MOVK = 0x12660c8 };
 #endif
+static int render_720(void) { const char *e = getenv("TOTK_RENDER_RES"); return !ios_code() && e && !strcmp(e, "720"); }
 static void patch_render_1080(Module *m) {
     const char *e = getenv("TOTK_RENDER_RES");
     if (!ios_code() && e && !strcmp(e, "900")) { fprintf(stderr, "[botw] docked render size 1600x900, as shipped (TOTK_RENDER_RES=900)\n"); return; }
@@ -550,9 +555,10 @@ static void patch_render_1080(Module *m) {
             runtime_fail("1080p render size requires the " TOTK_GAME_VERSION " display-mode instructions");
         }
     }
-    const uint32_t movk = 0xf2e89e08u;   /* movk x8, #0x44f0, lsl #48 */
+    const uint32_t movk = render_720() ? 0xf2e89408u : 0xf2e89e08u;   /* movk x8, #0x44a0 / #0x44f0, lsl #48 */
     put_word(m, RENDER_MOVK, movk, "docked render size");
-    fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
+    fprintf(stderr, render_720() ? "[botw] docked render size 1280x720 under the 1080p canvas (TOTK_RENDER_RES=720)\n"
+                                 : "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
 }
 /* The phone's render size (user 2026-10-23: "内部960×540，输出 用默认 放大机制"): the iPhone / iPad runs the handheld
    mode, whose branch of the 1.6.0 display-mode routine (jump table at main+0x26164f8: mode 1 -> main+0x18216c8) stores
@@ -762,7 +768,10 @@ static uint64_t output_floats(unsigned screen, unsigned render) {
 }
 static void output_page(unsigned w, unsigned h) {   /* what the docked branch writes from its next run on */
     const char *e = getenv("TOTK_RENDER_RES");
-    unsigned render = w == 1920 && h == 1080 && e && !strcmp(e, "900") ? 1600 : w;   /* the shipped 1600x900 scene at 1080p only */
+    unsigned render = w;   /* the shipped 1600x900 or a 1280x720 scene, at the 1080p canvas only */
+    if (w == 1920 && h == 1080 && e && !strcmp(e, "900")) render = 1600;
+    if (w == 1920 && h == 1080 && render_720()) render = 1280;
+    { static unsigned told; if (render != w && told != render) { told = render; fprintf(stderr, "[botw] scene %ux%u under the %ux%u canvas (TOTK_RENDER_RES=%s)\n", render, render * h / w, w, h, e); } }
     atomic_store(&g_out_page[0], output_floats(w, render));
     atomic_store(&g_out_page[1], w | ((uint64_t)h << 32));
     atomic_store(&g_out_cur, w | ((uint64_t)h << 32));
