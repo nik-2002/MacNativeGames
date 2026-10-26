@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/attr.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,12 +82,28 @@ typedef struct {
  uint64_t dev,ino,size;
  int64_t mtime_sec,mtime_nsec,ctime_sec,ctime_nsec,birth_sec,birth_nsec;
 } RomfsProof;
-static RomfsProof proof_for(const struct stat *s) {
+static RomfsProof proof_raw(const struct stat *s) {
  RomfsProof p={0};memcpy(p.magic,"TOTKRFS-PROOF-1",16);memcpy(p.sha256,ROMFS_IMAGE_SHA256,65);
  p.dev=(uint64_t)s->st_dev;p.ino=(uint64_t)s->st_ino;p.size=(uint64_t)s->st_size;
  p.mtime_sec=s->st_mtimespec.tv_sec;p.mtime_nsec=s->st_mtimespec.tv_nsec;
  p.ctime_sec=s->st_ctimespec.tv_sec;p.ctime_nsec=s->st_ctimespec.tv_nsec;
  p.birth_sec=s->st_birthtimespec.tv_sec;p.birth_nsec=s->st_birthtimespec.tv_nsec;
+ return p;
+}
+/* The app moved to a USB drive: st_dev is handed out at mount, so it changes with plug order, and a record keyed on it
+   hashed all 17.6 GB over USB at each start. The volume's UUID names the volume instead (dev = its FNV-1a hash, the
+   top bit set so it never equals a device number). exFAT and FAT make up inode numbers and ctime, so off APFS and HFS
+   the record holds size, mtime and birth time only. */
+static RomfsProof proof_for(int fd,const struct stat *s) {
+ RomfsProof p=proof_raw(s);struct statfs fs;
+ if(fstatfs(fd,&fs))return p;
+ struct attrlist al={.bitmapcount=ATTR_BIT_MAP_COUNT,.volattr=ATTR_VOL_INFO|ATTR_VOL_UUID};
+ struct { uint32_t len; uuid_t uuid; } __attribute__((packed)) vol;
+ if(!getattrlist(fs.f_mntonname,&al,&vol,sizeof vol,0)){
+  uint64_t h=1469598103934665603ull;for(int i=0;i<16;i++){h^=vol.uuid[i];h*=1099511628211ull;}
+  p.dev=h|1ull<<63;
+ }
+ if(strcmp(fs.f_fstypename,"apfs")&&strcmp(fs.f_fstypename,"hfs")){p.ino=0;p.ctime_sec=p.ctime_nsec=0;}
  return p;
 }
 static int proof_equal(const RomfsProof *a,const RomfsProof *b) {
@@ -99,7 +117,7 @@ static int proof_equal(const RomfsProof *a,const RomfsProof *b) {
 static void chunk_proofs(RomfsProof *out) {
  /* ctime is left out: reinstalling the iOS app touches the data container's file metadata (ctime) without changing a
     byte, which made every launch hash 17 GB again. A content change still moves mtime (and size). */
- for(unsigned c=0;c<nchunks;c++){struct stat st;need(fstat(chunk_fds[c],&st)==0&&S_ISREG(st.st_mode),"RomFS part stat");out[c]=proof_for(&st);out[c].ctime_sec=out[c].ctime_nsec=0;}
+ for(unsigned c=0;c<nchunks;c++){struct stat st;need(fstat(chunk_fds[c],&st)==0&&S_ISREG(st.st_mode),"RomFS part stat");out[c]=proof_for(chunk_fds[c],&st);out[c].ctime_sec=out[c].ctime_nsec=0;}
 }
 static void verify_chunks(const char *dir) {
  RomfsProof want[MAX_CHUNKS],saved[MAX_CHUNKS],after[MAX_CHUNKS];size_t bytes=nchunks*sizeof(RomfsProof);chunk_proofs(want);
@@ -131,21 +149,29 @@ static void verify_image(int fd,const char *dir) {
  if(nchunks){verify_chunks(dir);return;}
  const char *pdir=getenv("TOTK_ROMFS_PROOF_DIR");if(pdir&&*pdir)dir=pdir;
  struct stat before,after;need(fstat(fd,&before)==0&&S_ISREG(before.st_mode),"RomFS image stat");
- RomfsProof want=proof_for(&before),saved;
+ RomfsProof want=proof_for(fd,&before),raw=proof_raw(&before),saved;
  /* One record per image (device and inode in the name): the app's copy and a work folder's copy share the proof
     directory, and with a single record each start of the other copy hashed all 17.6 GB again (14 s, 2026-10-25). The
-    record of the old shared name is still accepted when it is this image's. */
- char path[4096],tmp[4096],legacy[4096];
+    records of the device-keyed names (before the volume UUID) are still accepted when they are this image's. */
+ char path[4096],tmp[4096],olds[2][4096];
  need(snprintf(path,sizeof(path),"%s/.romfs-verified-v1-%llx-%llx",dir,(unsigned long long)want.dev,(unsigned long long)want.ino)<(int)sizeof(path),"RomFS proof path");
- need(snprintf(legacy,sizeof(legacy),"%s/.romfs-verified-v1",dir)<(int)sizeof(legacy),"RomFS proof path");
+ need(snprintf(olds[0],sizeof(olds[0]),"%s/.romfs-verified-v1-%llx-%llx",dir,(unsigned long long)raw.dev,(unsigned long long)raw.ino)<(int)sizeof(olds[0]),"RomFS proof path");
+ need(snprintf(olds[1],sizeof(olds[1]),"%s/.romfs-verified-v1",dir)<(int)sizeof(olds[1]),"RomFS proof path");
  int force=getenv("TOTK_ROMFS_VERIFY")&&!strcmp(getenv("TOTK_ROMFS_VERIFY"),"full");
- int proof_fd=open(path,O_RDONLY|O_NOFOLLOW);if(proof_fd<0)proof_fd=open(legacy,O_RDONLY|O_NOFOLLOW);
+ int proof_fd=open(path,O_RDONLY|O_NOFOLLOW);
+ for(int i=0;proof_fd<0&&i<2;i++)proof_fd=open(olds[i],O_RDONLY|O_NOFOLLOW);
  if(proof_fd>=0){struct stat ps;int ok=fstat(proof_fd,&ps)==0&&S_ISREG(ps.st_mode)&&ps.st_size==sizeof(saved)&&read(proof_fd,&saved,sizeof(saved))==sizeof(saved);close(proof_fd);
+  if(ok&&!force&&proof_equal(&saved,&raw)&&!proof_equal(&raw,&want)){
+   /* A device-keyed record of this image: write it under the volume's name and keep going. */
+   if(snprintf(tmp,sizeof(tmp),"%s.%ld.tmp",path,(long)getpid())<(int)sizeof(tmp)){
+    int out=open(tmp,O_WRONLY|O_CREAT|O_EXCL,0600);
+    if(out>=0){int good=write(out,&want,sizeof(want))==sizeof(want)&&fsync(out)==0;close(out);if(!good||rename(tmp,path))unlink(tmp);}}
+   saved=want;}
   if(ok&&!force&&proof_equal(&saved,&want)){fprintf(stderr,"[ssbu] RomFS unchanged; reused full SHA256 verification record (%llu bytes)\n",(unsigned long long)want.size);runtime_boot_progress(TOTK_UI("游戏资源校验记录有效","Game data verification record is valid"),want.size,want.size);return;}}
  fprintf(stderr,"[ssbu] verifying local RomFS SHA256 (%llu bytes)%s\n",(unsigned long long)want.size,force?" [forced]":"");
  runtime_boot_progress(TOTK_UI("校验游戏资源","Verifying game data"),0,want.size);sha_fd(fd,ROMFS_IMAGE_SHA256,want.size,TOTK_UI("校验游戏资源","Verifying game data"));
  need(fstat(fd,&after)==0,"RomFS image stat after hash");
- RomfsProof finished=proof_for(&after);need(proof_equal(&want,&finished),"RomFS changed during verification");
+ RomfsProof finished=proof_for(fd,&after);need(proof_equal(&want,&finished),"RomFS changed during verification");
  if(snprintf(tmp,sizeof(tmp),"%s.%ld.tmp",path,(long)getpid())>=(int)sizeof(tmp))return;
  int out=open(tmp,O_WRONLY|O_CREAT|O_EXCL,0600);
  if(out>=0){ssize_t n=write(out,&want,sizeof(want));int ok=n==sizeof(want)&&fsync(out)==0;close(out);

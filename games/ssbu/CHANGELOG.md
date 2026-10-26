@@ -31,6 +31,13 @@
   stood in for); D-pad navigation moves to the item in line; no focus ring; the Switch font is the page default and
   button glyphs render. Y Help fades to black at once and its web process is started ahead.
 
+### Portable app
+
+- The app can live on a USB drive: the game data is inside it and found from the app's own place, while saves, the shader
+  cache and logs stay in Application Support on the Mac. The data check's record names the volume by its UUID instead of
+  the device number macOS hands out at each mount, and off APFS/HFS (exFAT) it leaves out the made-up inode and ctime, so
+  a moved or replugged copy does not hash 17.6 GB again. Moving the app within the Mac: checked, reused in 1.7 s.
+
 ### Controllers
 
 - Controllers keep playing while another app is in front (`SSBU_BACKGROUND_PADS=0`: frontmost only), are read on their
