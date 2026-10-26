@@ -270,6 +270,10 @@ static NSString *rt_variant(NSString *shader, int stage, const uint8_t *control,
     [g_msl_checked addObject:variant];
     [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
     g_translated++;
+    /* The translator's scratch files: the guest code it read (.code), its SPIR-V (.spv, about half the cache) and its
+       reply (.res.json). Nothing reads them once the MSL and its reflection are written; a new variant writes new ones. */
+    for (NSString *ext in @[@"code", @"spv", @"res.json"])
+        unlink([ssbu_rt_dir() stringByAppendingFormat:@"/%@.%@", variant, ext].fileSystemRepresentation);
     if (!existed) { atomic_fetch_add(&g_new_variants, 1); atomic_store(&g_new_variant_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }   // discovered, translated, in the cache
     if (!existed) totk_contrib_add(shader, refl[@"deps"] ?: @{});   // the seed would have had it if the shared list named it
     if (getenv("TOTK_SURVEY_SHADER_LOG")) LOG("[survey-shader] frame %llu translated %s %s in %.2f ms%s",
