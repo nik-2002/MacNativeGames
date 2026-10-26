@@ -242,6 +242,9 @@ static void release_codec(Movie *m) {
     if (m->vpx_live) { vpx_codec_destroy(&m->vpx); m->vpx_live = 0; }
     for (int i = 0; i < IN_BUFS; i++) { free(m->in[i]); m->in[i] = NULL; }
     for (int i = 0; i < OUT_BUFS; i++) { free(m->out[i]); m->out[i] = NULL; }
+    /* no frame stays held: a looping menu clip resets at its end while the game still holds a frame, and reading it
+       afterwards used to copy from the freed buffer (a crash some minutes into the menus) */
+    memset(m->out_held, 0, sizeof m->out_held); memset(m->out_bytes, 0, sizeof m->out_bytes);
     m->configured = m->started = 0; m->nin_free = m->npending = m->nready = m->ndecoded = 0; m->t0 = 0;
 }
 static void reset_queues(Movie *m) {
@@ -412,7 +415,7 @@ static int h_get_output(void *obj, int index, void *buf) {
     G.buf_set_range(buf, 0, 0);
     pthread_mutex_lock(&m->mu);
     int st = ST_ERROR;
-    if (index >= 0 && index < OUT_BUFS && m->out_held[index]) {
+    if (index >= 0 && index < OUT_BUFS && m->out_held[index] && m->out[index]) {
         int bytes = m->out_bytes[index]; uint8_t *dst = G.buf_base(buf);
         if (!bytes) st = ST_OK;
         else if (dst && G.buf_capacity(buf) >= (size_t)bytes) { memcpy(dst, m->out[index], (size_t)bytes); G.buf_set_range(buf, 0, bytes); st = ST_OK; }

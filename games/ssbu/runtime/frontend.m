@@ -82,9 +82,10 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
   bootProgress.doubleValue=percent;
  });
 }
+static void page_prewarm(void);   /* the manual's web process, started once the game runs (below) */
 void runtime_warm_ready(void){   /* the startup pipelines are ready and the game goes on: the loading screen goes */
  atomic_store(&warmPending,0);
- dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))bootOverlay.hidden=YES;});
+ dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))bootOverlay.hidden=YES;page_prewarm();});
 }
 void runtime_warm_done(void){
  atomic_store(&warmPending,0);
@@ -445,16 +446,28 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
    closes it. The pages come from <work>/manual/html-document (make manual: the HtmlDocument NCA of the player's base game
    and update). Their scripts call the applet's "nx" object (endApplet, footer, playReport): a stand-in answers every call,
    endApplet closes the page. Controls: mouse; B / Escape go back, or close on the first page; D-pad / left stick scroll.
-   No buttons of our own: the pages draw the applet's button guide themselves ("B Back"). */
+   No buttons of our own: the pages draw the applet's button guide themselves ("B Back").
+   The main menu's Help pages (How to Play, contents/howto) are a small app that reads the browser's Gamepad API instead:
+   navigator.getGamepads()[0] in the NX browser's order (0 B, 1 A, 2 Y, 3 X, 4 L, 5 R, 6 ZL, 7 ZR, 8 -, 9 +, 10/11 stick
+   clicks, 12-15 up/down/left/right) is a stand-in fed from every controller and the game's keyboard keys. While a page
+   reads it, the page handles B itself. Its list page stays hidden (black) until a link has the focus, which the NX
+   browser gives the first link; the stand-in does the same. Leaving to http://localhost/ is the applet's "close". */
 @interface TOTKPageView:NSView<WKScriptMessageHandler,WKNavigationDelegate>
 @property(strong) WKWebView *web;
 @property(strong) NSTimer *pad;
-@property uint64_t prev;
+@property(strong) id keys;
+@property uint64_t prev,keyBits,sent;
+@property BOOL padOwned;
+@property unsigned tick;
 @property(copy) void(^done)(void);
 @end
 @implementation TOTKPageView
 -(void)userContentController:(WKUserContentController *)c didReceiveScriptMessage:(WKScriptMessage *)m{(void)c;(void)m;[self finish];}
--(void)finish{[self.pad invalidate];self.pad=nil;void(^d)(void)=self.done;self.done=nil;if(!d)return;
+-(void)webView:(WKWebView *)w decidePolicyForNavigationAction:(WKNavigationAction *)a decisionHandler:(void(^)(WKNavigationActionPolicy))h{
+ (void)w;if([a.request.URL.host isEqualToString:@"localhost"]){h(WKNavigationActionPolicyCancel);[self finish];return;}
+ h(WKNavigationActionPolicyAllow);}
+-(void)finish{[self.pad invalidate];self.pad=nil;if(self.keys){[NSEvent removeMonitor:self.keys];self.keys=nil;}
+ void(^d)(void)=self.done;self.done=nil;if(!d)return;
  [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c){c.duration=0.15;self.animator.alphaValue=0;} completionHandler:d];}
 -(void)back{if(self.web.canGoBack)[self.web goBack];else [self finish];}
 -(BOOL)acceptsFirstResponder{return YES;}
@@ -465,21 +478,55 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
 -(void)cancelOperation:(id)sender{(void)sender;[self back];}
 -(void)keyDown:(NSEvent *)e{if(e.keyCode==53)[self back];else [super keyDown:e];}
 -(void)webView:(WKWebView *)w didFailProvisionalNavigation:(WKNavigation *)n withError:(NSError *)e{
- fprintf(stderr,"[ssbu] offline page: load failed: %s\n",e.localizedDescription.UTF8String);self.alphaValue=1;(void)w;(void)n;}
+ fprintf(stderr,"[ssbu] offline page: load failed: %s\n",e.localizedDescription.UTF8String);w.alphaValue=1;(void)n;}
 -(void)webView:(WKWebView *)w didFinishNavigation:(WKNavigation *)n{(void)n;[w.window makeFirstResponder:w];
- /* shown once the page has drawn (no white first frame), faded in like the applet */
+ if(w.alphaValue>0)return;   /* a later page of the same visit: the page does its own transition */
+ /* the page over the black backdrop once it has drawn (no white first frame), faded in like the applet */
  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(80*NSEC_PER_MSEC)),dispatch_get_main_queue(),^{
-  [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c){c.duration=0.2;self.animator.alphaValue=1;} completionHandler:nil];});}
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c){c.duration=0.2;w.animator.alphaValue=1;} completionHandler:nil];});}
+-(uint64_t)keyBit:(unsigned short)k{   /* the game's keyboard controls (README), as Npad button bits */
+ switch(k){case 38:return 1;case 40:case 49:return 2;case 34:return 4;case 32:return 8;case 12:return 1u<<6;case 14:return 1u<<7;
+  case 36:return 1u<<10;case 48:return 1u<<11;case 13:case 17:case 126:return 1u<<13;case 1:case 5:case 125:return 1u<<15;
+  case 0:case 3:case 123:return 1u<<12;case 2:case 4:case 124:return 1u<<14;default:return 0;}}
+-(void)watchKeys{__weak TOTKPageView *me=self;   /* the game's keys drive the page as a controller does; other keys and Escape stay the web view's */
+ self.keys=[NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown|NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e){
+  TOTKPageView *p=me;uint64_t bit=p&&!(e.modifierFlags&NSEventModifierFlagCommand)?[p keyBit:e.keyCode]:0;if(!bit)return e;
+  p.keyBits=e.type==NSEventTypeKeyDown?p.keyBits|bit:p.keyBits&~bit;return nil;}];}
+-(void)feed:(uint64_t)b lx:(int32_t)lx ly:(int32_t)ly rx:(int32_t)rx ry:(int32_t)ry{   /* the Gamepad API stand-in */
+ static const int8_t nx[16]={1,0,3,2,10,11,4,5,6,7,9,8,14,12,15,13};   /* Npad bit -> NX browser button */
+ uint32_t m=0;for(int i=0;i<16;i++)if(b>>i&1)m|=1u<<nx[i];
+ uint64_t key=(uint64_t)m|(uint64_t)((lx/4096)&15)<<32|(uint64_t)((ly/4096)&15)<<36|(uint64_t)((rx/4096)&15)<<40|(uint64_t)((ry/4096)&15)<<44;
+ if(key==self.sent&&++self.tick%30)return;self.sent=key;   /* on a change, and twice a second to see whether the page reads it */
+ __weak TOTKPageView *me=self;
+ [self.web evaluateJavaScript:[NSString stringWithFormat:@"window.__nxPad&&window.__nxPad(%u,%.3f,%.3f,%.3f,%.3f)",m,lx/32767.0,-ly/32767.0,rx/32767.0,-ry/32767.0]
+  completionHandler:^(id r,NSError *e){(void)e;me.padOwned=[r isKindOfClass:NSNumber.class]&&[r boolValue];}];}
 -(void)poll{   /* every controller: B back, D-pad / left stick scroll (the game is waiting, so its reads are not disturbed) */
- uint64_t b=0;int32_t ly=0;
- for(int s=0;s<RUNTIME_GAMEPAD_SLOTS;s++){RuntimeGamepadState g;runtime_gamepad_read_slot(s,&g);b|=g.buttons;if(abs(g.ly)>abs(ly))ly=g.ly;}
+ uint64_t b=0;int32_t lx=0,ly=0,rx=0,ry=0;
+ for(int s=0;s<RUNTIME_GAMEPAD_SLOTS;s++){RuntimeGamepadState g;runtime_gamepad_read_slot(s,&g);b|=g.buttons;
+  if(abs(g.lx)>abs(lx))lx=g.lx;if(abs(g.ly)>abs(ly))ly=g.ly;if(abs(g.rx)>abs(rx))rx=g.rx;if(abs(g.ry)>abs(ry))ry=g.ry;}
+ if(self.prev==~0ull&&b){return;}   /* buttons held when the page opens (the A or Y that opened it) do not count */
+ b|=self.keyBits;[self feed:b lx:lx ly:ly rx:rx ry:ry];
  uint64_t press=b&~self.prev;self.prev=b;
+ if(self.padOwned)return;   /* the page reads the pad: B, scrolling and closing are its own */
  if(press&2){[self back];return;}
- int dy=(b&1u<<13)?-1:(b&1u<<15)?1:ly>12000?-1:ly<-12000?1:0;
- if(dy)[self.web evaluateJavaScript:[NSString stringWithFormat:@"window.scrollBy(0,%d)",dy*24] completionHandler:nil];
+ if(press&1){[self.web evaluateJavaScript:@"window.__nxNav&&window.__nxNav(0,0)" completionHandler:nil];return;}   /* A: the focused link */
+ /* D-pad / left stick: the NX browser's focus moves to the nearest link that way, or the page scrolls; held, it repeats */
+ int dx=(b&1u<<12)?-1:(b&1u<<14)?1:lx<-16000?-1:lx>16000?1:0,dy=(b&1u<<13)?-1:(b&1u<<15)?1:ly>16000?-1:ly<-16000?1:0;
+ if(dy)dx=0;
+ int dir=dx?2+dx:dy?5+dy:0;static int held,lastDir;
+ if(!dir){held=0;lastDir=0;return;}
+ if(dir!=lastDir)held=0;lastDir=dir;
+ if(held++==0||(held>18&&(held-18)%6==0))
+  [self.web evaluateJavaScript:[NSString stringWithFormat:@"window.__nxNav&&window.__nxNav(%d,%d)",dx,dy] completionHandler:nil];
 }
 @end
 static __weak TOTKPageView *openPage;   /* main thread only */
+/* One web content process kept running from the end of the loading screen: starting it when the player presses Y Help
+   took most of a second, with the game's last frame standing still. */
+static WKProcessPool *pagePool;static WKWebView *pageWarm;
+static void page_prewarm(void){if(pagePool)return;pagePool=[WKProcessPool new];
+ WKWebViewConfiguration *cfg=[WKWebViewConfiguration new];cfg.processPool=pagePool;
+ pageWarm=[[WKWebView alloc] initWithFrame:NSMakeRect(0,0,16,16) configuration:cfg];[pageWarm loadHTMLString:@"" baseURL:nil];}
 static NSString *manual_file(NSString *path){   /* "contents/help/x.html" -> <work>/manual/html-document/contents.htdocs/help/x.html */
  NSString *root=[NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:@"manual/html-document"];
  NSArray<NSString *> *parts=path.pathComponents;if(!parts.count)return nil;
@@ -499,11 +546,41 @@ int runtime_front_offline_page(const char *document_path){
  dispatch_async(dispatch_get_main_queue(), ^{
   NSView *cv=window.contentView;
   TOTKPageView *page=[[TOTKPageView alloc] initWithFrame:cv.bounds];page.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
-  WKWebViewConfiguration *cfg=[WKWebViewConfiguration new];
+  WKWebViewConfiguration *cfg=[WKWebViewConfiguration new];page_prewarm();cfg.processPool=pagePool;
   [cfg.preferences setValue:@YES forKey:@"allowFileAccessFromFileURLs"];
   NSString *shim=@"(function(){function stub(){return new Proxy(function(){},{get:function(t,k){if(k==='then')return undefined;if(!(k in t))t[k]=stub();return t[k];},apply:function(){return undefined;}});}"
    "var nx=stub();nx.endApplet=function(){window.webkit.messageHandlers.nx.postMessage('end');};window.nx=nx;"
-   "if(!window.endApplet)window.endApplet=function(){nx.endApplet();};})();";
+   "if(!window.endApplet)window.endApplet=function(){nx.endApplet();};"
+   "var pad={id:'nx',index:0,connected:true,mapping:'standard',timestamp:0,buttons:[],axes:[0,0,0,0]},read=0;"
+   "for(var i=0;i<16;i++)pad.buttons.push({pressed:false,touched:false,value:0});"
+   "Object.defineProperty(navigator,'getGamepads',{configurable:true,value:function(){read=Date.now();return [pad,null,null,null];}});"
+   "window.__nxPad=function(m,lx,ly,rx,ry){for(var i=0;i<16;i++){var p=!!(m>>i&1);pad.buttons[i].pressed=pad.buttons[i].touched=p;pad.buttons[i].value=p?1:0;}"
+   "pad.axes=[lx,ly,rx,ry];pad.timestamp=performance.now();return read>0&&Date.now()-read<1000;};"
+   "window.__nxNav=function(dx,dy){var c=document.activeElement;"   /* (0,0): activate the focused link */
+   "if(!dx&&!dy){if(c&&c!==document.body)c.click();return;}"
+   "var vw=innerWidth,vh=innerHeight,best=null,bs=1e9,r0=c&&c!==document.body?c.getBoundingClientRect():null;"
+   "var cx=r0?r0.left+r0.width/2:vw/2,cy=r0?r0.top+r0.height/2:(dy>0?-1:vh+1);"
+   "var l=document.querySelectorAll('a[href],a[ref],button,[tabindex]:not([tabindex=\"-1\"])');"
+   "for(var i=0;i<l.length;i++){var e=l[i];if(e===c||e.tabIndex<0)continue;var r=e.getBoundingClientRect();if(!r.width||!r.height)continue;"
+   "if(r.bottom<-vh/2||r.top>vh*1.5||getComputedStyle(e).visibility==='hidden')continue;"
+   "var along,lo,hi,clo,chi;if(!r0){along=dy>0?r.top:dy<0?vh-r.bottom:dx>0?r.left:vw-r.right;lo=hi=clo=chi=0;}"   /* edges, not centres: */
+   "else if(dx){along=dx>0?r.left-r0.right:r0.left-r.right;lo=r.top;hi=r.bottom;clo=r0.top;chi=r0.bottom;}"   /* what lies straight that */
+   "else{along=dy>0?r.top-r0.bottom:r0.top-r.bottom;lo=r.left;hi=r.right;clo=r0.left;chi=r0.right;}"   /* way wins over what is */
+   "if(along<-8)continue;var gap=Math.max(0,lo-chi,clo-hi);var s=Math.max(along,0)+(gap>0?2000+gap*2:0);"   /* nearer but off to the side */
+   "if(s<bs){bs=s;best=e;}}"
+   "if(best&&(!r0||bs<2000+vh)){best.focus();best.scrollIntoView({block:'nearest',inline:'nearest',behavior:'smooth'});}"
+   "else window.scrollBy({left:dx*vw/4,top:dy*vh/4,behavior:'smooth'});};"
+   "var fk='nxfocus:'+location.pathname;"   /* coming back to a list, the link it was left from, as the NX browser keeps it */
+   "document.addEventListener('focusin',function(e){var t=e.target,h=t&&t.tagName==='A'&&(t.getAttribute('ref')||t.getAttribute('href'));if(h)try{sessionStorage.setItem(fk,h);}catch(x){}});"
+   "window.addEventListener('load',function(){requestAnimationFrame(function(){requestAnimationFrame(function(){"   /* the NX browser's event once the */
+   "window.dispatchEvent(new Event('NXFirstPaintEndAfterLoad'));});});});"   /* loaded page has painted: Help lists start their images and intro on it */
+   "var ff=document.fonts,fadd=ff.addEventListener.bind(ff);"   /* Help lists wait for a font 'loadingdone' that WebKit */
+   "ff.addEventListener=function(t,f,o){fadd(t,f,o);if(t==='loadingdone')setTimeout(function(){ff.ready.then(function(){f({type:t,fontfaces:[]});});},100);};"   /* has sent already */
+   "function first(){var h=null;try{h=sessionStorage.getItem(fk);}catch(x){}"
+   "var l=[].filter.call(document.querySelectorAll('a[href],a[ref],[tabindex]'),function(e){var r=e.getBoundingClientRect();return e.tabIndex>=0&&r.width&&r.height;});"
+   "for(var i=0;i<l.length;i++)if(h&&(l[i].getAttribute('href')===h||l[i].getAttribute('ref')===h))return l[i];return l[0];}"
+   "window.addEventListener('load',function(){setTimeout(function(){"   /* after the page's own load handlers; lists drawn from */
+   "if(document.activeElement!==document.body)return;var a=first();if(a)a.focus();},read?0:1200);});})();";   /* the pad at once, others after their intro */
   [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:shim injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
   /* The applet's own fonts: the pages' button guide ("B Back") names keyhelpFont / KeyHelpFont without a file, the Switch's
      standard UI font with the Nintendo extension font for the button glyphs (make manual decodes both into system-fonts). */
@@ -521,13 +598,16 @@ int runtime_front_offline_page(const char *document_path){
   __weak TOTKPageView *weakPage=page;
   page.done=^{TOTKPageView *p=weakPage;[p.web.configuration.userContentController removeScriptMessageHandlerForName:@"nx"];[p removeFromSuperview];
    [window makeFirstResponder:window.contentView];runtime_input_clear();dispatch_semaphore_signal(sem);};
-  page.alphaValue=0;[cv addSubview:page];openPage=page;runtime_input_clear();
+  /* the game picture fades to black at once, as the applet's screen does, while the page loads behind it */
+  page.alphaValue=0;web.alphaValue=0;[cv addSubview:page];openPage=page;runtime_input_clear();
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c){c.duration=0.15;page.animator.alphaValue=1;} completionHandler:nil];
   NSURL *root=[NSURL fileURLWithPath:[NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:@"manual/html-document"] isDirectory:YES];
   NSURL *url=[NSURL URLWithString:[[NSURL fileURLWithPath:file].absoluteString stringByAppendingString:query]];
   [web loadFileURL:url?:[NSURL fileURLWithPath:file] allowingReadAccessToURL:root];
   page.prev=~0ull;   /* buttons held when the page opens (the Y that opened it) do not count */
   page.pad=[NSTimer timerWithTimeInterval:1.0/60 target:page selector:@selector(poll) userInfo:nil repeats:YES];
   [NSRunLoop.mainRunLoop addTimer:page.pad forMode:NSRunLoopCommonModes];
+  [page watchKeys];
   if(!assume_focus()){[NSApp activateIgnoringOtherApps:YES];[window makeKeyAndOrderFront:nil];}
   [window makeFirstResponder:page];
   fprintf(stderr,"[ssbu] offline page shown: %s\n",file.UTF8String);
@@ -547,6 +627,11 @@ void runtime_front_offline_test(const char *op){
     fprintf(stderr,"[ssbu] offline page test: picture %s %s%s\n",path.UTF8String,ok?"written":"FAILED ",ok?"":(err.localizedDescription?:@"").UTF8String);}];}
   else if([o isEqualToString:@"frame"])fprintf(stderr,"[ssbu] offline page test: view %.0fx%.0f, page at %.0f,%.0f %.0fx%.0f, zoom %.3f, alpha %.2f\n",
    page.bounds.size.width,page.bounds.size.height,page.web.frame.origin.x,page.web.frame.origin.y,page.web.frame.size.width,page.web.frame.size.height,page.web.pageZoom,page.alphaValue);
+  else if([o hasPrefix:@"pad "]){uint64_t bits=strtoull([o substringFromIndex:4].UTF8String,NULL,0);   /* Npad buttons held 150 ms */
+   page.keyBits|=bits;dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(150*NSEC_PER_MSEC)),dispatch_get_main_queue(),^{page.keyBits&=~bits;});
+   fprintf(stderr,"[ssbu] offline page test: pad 0x%llx (page reads the pad: %s)\n",(unsigned long long)bits,page.padOwned?"yes":"no");}
+  else if([o hasPrefix:@"js "])[page.web evaluateJavaScript:[o substringFromIndex:3] completionHandler:^(id r,NSError *e){   /* "js <expression>": its value */
+   fprintf(stderr,"[ssbu] offline page test: js -> %s\n",(e?e.localizedDescription:[NSString stringWithFormat:@"%@",r]).UTF8String);}];
   else if([o isEqualToString:@"close"])[page finish];
   else if([o isEqualToString:@"back"])[page back];
  });
