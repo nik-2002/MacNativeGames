@@ -107,6 +107,14 @@ Controllers: every controller macOS sees (Switch Pro, DualSense, Xbox and others
 connect; the first one shares player 1 with the keyboard. Players 1–4 light their controller's player lamps. Rumble goes
 to the player the game vibrates. `SSBU_MERGE_PADS=1` makes every controller drive player 1 instead.
 
+- Controllers keep playing while another app or window is in front (the game on a TV, the Mac's own screen in use).
+- A controller that drops out (sleep, battery, Bluetooth) comes back as the same player; for two minutes a different new
+  controller does not take that player's place.
+- Sticks use a round dead zone that keeps their direction; diagonals past the rim are brought back onto the circle.
+- Controllers with only a pad and two buttons (a single Joy-Con held sideways) play: pad = stick, buttons = A and B,
+  menu = +.
+- Controller events are read on their own thread, so window resizing or full-screen switching does not delay them.
+
 Text entry (names): a bar with an on-screen keyboard opens over the game. Type on the Mac keyboard, click the keys, or use
 any controller: D-pad / stick move, A types, B deletes, Y adds a space, L capitals, R symbols, + done, − cancel.
 
@@ -118,6 +126,7 @@ Y Help opens the game's own manual pages over the game; B or Escape goes back an
 |---|---|
 | `SSBU_DLC=0` | Report no add-ons. |
 | `SSBU_MERGE_PADS=1` | All controllers drive player 1. |
+| `SSBU_BACKGROUND_PADS=0` | Controllers play only while the game is the frontmost app. |
 | `SSBU_WARM_BEFORE_START=0` | Start the game after the title shaders only (the old, stuttery order). |
 | `SSBU_SHADER_PREFETCH=0` | Do not translate shaders when the game loads them. |
 | `TOTK_RUMBLE=0` / `TOTK_GYRO=0` | No rumble / no motion sensor. |

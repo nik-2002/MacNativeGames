@@ -135,6 +135,8 @@ uint32_t runtime_gamepad_connected_mask(void);   /* bit s: slot s has a controll
 /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
    the background, so a button held at focus loss would otherwise stay pressed for the game. */
 void runtime_gamepad_clear(void);
+int runtime_gamepad_background(void);   /* 1: controllers send events while another app is in front */
+void runtime_input_focus_lost(void);    /* the window lost the keyboard: keys forgotten, background controllers kept */
 void runtime_touch_pad_set(const RuntimeGamepadState *state);   /* on-screen touch controls (iOS) */
 /* Controller rumble and motion (opt-in TOTK_RUMBLE=1 / TOTK_GYRO=1): the game's hid side in runtime/hid_feedback.c, the
    Mac controller's haptics and motion sensors in runtime/gamepad_feedback.m. */

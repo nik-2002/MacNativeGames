@@ -23,9 +23,16 @@ typedef struct {
     int toggleOn[CONTROLLER_BUTTONS];        /* for toggle */
     int toggleMoved[CONTROLLER_BUTTONS];     /* the stick moved since the toggle went on */
 } PadSlot;
-static PadSlot slots[RUNTIME_GAMEPAD_SLOTS];             /* state: gamepadLock; the mode state: main queue */
-static __weak GCController *slotOwner[RUNTIME_GAMEPAD_SLOTS];   /* main queue */
-static int mergePads;
+static PadSlot slots[RUNTIME_GAMEPAD_SLOTS];             /* gamepadLock */
+static __weak GCController *slotOwner[RUNTIME_GAMEPAD_SLOTS];   /* written on the main queue */
+/* Who had each slot last and when it left: a controller that drops out (sleep, battery, Bluetooth) comes back as the
+   same player, and for two minutes a different new controller does not take that player's place. */
+static char slotLast[RUNTIME_GAMEPAD_SLOTS][128];        /* main queue */
+static uint64_t slotLeftAt[RUNTIME_GAMEPAD_SLOTS];       /* main queue, ns */
+/* Controller events arrive on their own queue, not the main thread: window resizing, the full-screen animation or a
+   manual page there no longer hold back or bunch up the buttons. */
+static dispatch_queue_t padQueue;
+static int mergePads, backgroundPads;
 static void refresh_slot(int slot);
 
 /* The player's button layout (controller_map.h): TOTK_CONTROLS names the file (the launcher: <data>/controls.txt and
@@ -45,13 +52,17 @@ static void load_controller_map(void) {
     fprintf(stderr, "[ssbu-input] controller layout: %s (%d buttons changed)\n", path, changed);
 }
 
-static int32_t stick_axis(float value) {
+/* A stick as one vector: the dead zone is a circle and the direction is kept (a per-axis dead zone pulled
+   near-diagonals onto the axes, and Smash reads the angle), and square-gated controllers that report diagonals past
+   the rim are brought back onto the circle. */
+static void stick_pair(float x, float y, int32_t *ox, int32_t *oy) {
     const float deadzone = 0.12f;
-    float magnitude = fabsf(value);
-    if (magnitude <= deadzone) return 0;
-    if (magnitude > 1.0f) magnitude = 1.0f;
-    int32_t result = (int32_t)((magnitude - deadzone) / (1.0f - deadzone) * 32767.0f);
-    return value < 0 ? -result : result;
+    float magnitude = sqrtf(x * x + y * y);
+    if (!(magnitude > deadzone)) { *ox = *oy = 0; return; }
+    float scaled = (magnitude - deadzone) / (1.0f - deadzone);
+    if (scaled > 1.0f) scaled = 1.0f;
+    float k = scaled / magnitude * 32767.0f;
+    *ox = (int32_t)lrintf(x * k); *oy = (int32_t)lrintf(y * k);
 }
 
 static int32_t stronger_axis(int32_t a, int32_t b) {
@@ -94,15 +105,24 @@ static void refresh_slot(int slot) {
     RuntimeGamepadState next = {0};
     uint64_t physical = 0;
     for (GCController *controller in GCController.controllers) {
+        if (slot_of(controller) != slot) continue;
         GCExtendedGamepad *pad = controller.extendedGamepad;
-        if (!pad || slot_of(controller) != slot) continue;
+        GCMicroGamepad *micro = pad ? nil : controller.microGamepad;
+        int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+        if (pad) {
+            physical |= gamepad_buttons(pad, face_by_position(controller));
+            stick_pair(pad.leftThumbstick.xAxis.value, pad.leftThumbstick.yAxis.value, &lx, &ly);
+            stick_pair(pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value, &rx, &ry);
+        } else if (micro) {   /* a controller with only a pad and two buttons (a single Joy-Con held sideways, a remote):
+            the pad is the stick, its main button A, the other B, its menu button + */
+            physical |= (micro.buttonA.isPressed ? 2ULL : 0) | (micro.buttonX.isPressed ? 1ULL : 0) | (micro.buttonMenu.isPressed ? 1ULL << 10 : 0);
+            stick_pair(micro.dpad.xAxis.value, micro.dpad.yAxis.value, &lx, &ly);
+        } else continue;
         next.connected = 1;
-        physical |= gamepad_buttons(pad, face_by_position(controller));
-        next.lx = stronger_axis(next.lx, stick_axis(pad.leftThumbstick.xAxis.value));
-        next.ly = stronger_axis(next.ly, stick_axis(pad.leftThumbstick.yAxis.value));
-        next.rx = stronger_axis(next.rx, stick_axis(pad.rightThumbstick.xAxis.value));
-        next.ry = stronger_axis(next.ry, stick_axis(pad.rightThumbstick.yAxis.value));
+        next.lx = stronger_axis(next.lx, lx); next.ly = stronger_axis(next.ly, ly);
+        next.rx = stronger_axis(next.rx, rx); next.ry = stronger_axis(next.ry, ry);
     }
+    pthread_mutex_lock(&gamepadLock);   /* the mode state below is also reset by runtime_gamepad_clear */
     /* Modes work on the physical buttons, not on the mapped ones: two physical buttons may share a Switch button
        (X and L3 both running), and a mapped edge would be lost while the other one is held. */
     uint64_t now = runtime_now_ns(), edges = physical & ~p->physicalPrev, synthetic = 0, suppressed = 0;
@@ -114,7 +134,7 @@ static void refresh_slot(int slot) {
         if (kind == CONTROLLER_TAP && (edges & bit)) {
             p->tapUntil[i] = now + 400000000ULL;
             /* Release the pulse even if the controller sends no further event. */
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{ refresh_slot(slot); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), padQueue, ^{ refresh_slot(slot); });
         }
         if (kind == CONTROLLER_TOGGLE) {
             if (edges & bit) { p->toggleOn[i] = !p->toggleOn[i]; p->toggleMoved[i] = moving; }
@@ -136,7 +156,6 @@ static void refresh_slot(int slot) {
     uint64_t held = physical & ~suppressed;
     for (int i = 0; i < CONTROLLER_BUTTONS; i++) if (controllerModes[i] != CONTROLLER_HOLD) held &= ~(1ULL << i);
     next.buttons |= controller_map_apply(controllerMap, held) | synthetic;
-    pthread_mutex_lock(&gamepadLock);
     p->pressedEdges |= next.buttons & ~p->state.buttons;
     p->state = next;
     pthread_mutex_unlock(&gamepadLock);
@@ -147,38 +166,55 @@ static void show_player(GCController *controller, int slot) {
     controller.playerIndex = slot >= 0 && slot < 4 ? (GCControllerPlayerIndex)(GCControllerPlayerIndex1 + slot) : GCControllerPlayerIndexUnset;
 }
 
-static void attach_gamepad(GCController *controller) {
+static void signature(GCController *controller, char out[128]) {
+    snprintf(out, 128, "%s|%s", (controller.vendorName ?: @"").UTF8String, (controller.productCategory ?: @"").UTF8String);
+}
+
+/* The slot for a controller that connects: the one it had before, else the lowest free one nobody left within two
+   minutes, else the lowest free one. */
+static int choose_slot(GCController *controller) {
+    char sig[128]; signature(controller, sig);
+    uint64_t now = runtime_now_ns(), hold = 120ULL * 1000000000ULL;
+    for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS; i++) if (!slotOwner[i] && slotLeftAt[i] && !strcmp(slotLast[i], sig)) return i;
+    for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS; i++) if (!slotOwner[i] && (!slotLeftAt[i] || now - slotLeftAt[i] > hold)) return i;
+    for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS; i++) if (!slotOwner[i]) return i;
+    return -1;
+}
+
+static void attach_gamepad(GCController *controller) {   /* main queue */
     GCExtendedGamepad *pad = controller.extendedGamepad;
-    if (!pad) return;
+    GCMicroGamepad *micro = pad ? nil : controller.microGamepad;
+    if (!pad && !micro) return;
     int slot = slot_of(controller);
-    if (slot < 0) for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS && slot < 0; i++) if (!slotOwner[i]) { slotOwner[i] = controller; slot = i; }
+    if (slot < 0 && (slot = choose_slot(controller)) >= 0) { slotOwner[slot] = controller; signature(controller, slotLast[slot]); slotLeftAt[slot] = 0; }
     if (slot < 0) {
         fprintf(stderr, "[ssbu-input] native gamepad ignored, all %d players taken: %s\n", RUNTIME_GAMEPAD_SLOTS,
                 (controller.vendorName ?: @"unknown").UTF8String);
         return;
     }
     show_player(controller, slot);
-    pad.valueChangedHandler = ^(GCExtendedGamepad *changed, GCControllerElement *element) {
-        (void)changed; (void)element;
-        int now = slot_of(controller);
-        if (now >= 0) refresh_slot(now);
-    };
+    controller.handlerQueue = padQueue;
+    __weak GCController *weak = controller;
+    void (^changed)(void) = ^{ GCController *c = weak; int now = c ? slot_of(c) : -1; if (now >= 0) refresh_slot(now); };
+    if (pad) pad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *e) { (void)g; (void)e; changed(); };
+    else micro.valueChangedHandler = ^(GCMicroGamepad *g, GCControllerElement *e) { (void)g; (void)e; changed(); };
     fprintf(stderr, "[ssbu-input] native gamepad connected as player %d: %s (%s), face buttons by %s\n", slot + 1,
             (controller.vendorName ?: @"unknown").UTF8String,
-            (controller.productCategory ?: @"unknown").UTF8String, face_by_position(controller) ? "position" : "label");
+            (controller.productCategory ?: @"unknown").UTF8String, micro ? "a pad and two buttons only" : face_by_position(controller) ? "position" : "label");
     runtime_feedback_attach(controller, slot);
-    refresh_slot(slot);
+    dispatch_async(padQueue, ^{ refresh_slot(slot); });
 }
 
-static void detach_gamepad(GCController *controller) {
+static void detach_gamepad(GCController *controller) {   /* main queue */
     int slot = slot_of(controller);
     fprintf(stderr, "[ssbu-input] native gamepad disconnected (player %d): %s\n", slot + 1,
             (controller.vendorName ?: @"unknown").UTF8String);
     controller.extendedGamepad.valueChangedHandler = nil;
+    controller.microGamepad.valueChangedHandler = nil;
     runtime_feedback_detach(controller);
     if (slot < 0) return;
-    if (!mergePads) slotOwner[slot] = nil;
-    refresh_slot(slot);
+    if (!mergePads) { slotOwner[slot] = nil; slotLeftAt[slot] = runtime_now_ns() | 1; }
+    dispatch_async(padQueue, ^{ refresh_slot(slot); });
 }
 
 void runtime_gamepad_start(void) {
@@ -187,6 +223,15 @@ void runtime_gamepad_start(void) {
     mergePads = getenv("SSBU_MERGE_PADS") && atoi(getenv("SSBU_MERGE_PADS"));
     if (mergePads) fprintf(stderr, "[ssbu-input] SSBU_MERGE_PADS: every controller is player 1\n");
     load_controller_map();
+    padQueue = dispatch_queue_create("ssbu.gamepad", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+#if TARGET_OS_OSX
+    /* Controllers keep playing while another window has the keyboard (the game on a TV, the Mac's own screen in use):
+       macOS otherwise sends their events only to the frontmost app. SSBU_BACKGROUND_PADS=0: frontmost only. */
+    const char *bg = getenv("SSBU_BACKGROUND_PADS");
+    backgroundPads = !(bg && !strcmp(bg, "0"));
+    if (@available(macOS 11.3, *)) GCController.shouldMonitorBackgroundEvents = backgroundPads;
+    fprintf(stderr, "[ssbu-input] controllers %s\n", backgroundPads ? "also play while another app is in front" : "play only while the game is in front");
+#endif
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     [center addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
                    usingBlock:^(NSNotification *notification) { attach_gamepad(notification.object); }];
@@ -211,6 +256,8 @@ void runtime_gamepad_clear(void) {
     }
     pthread_mutex_unlock(&gamepadLock);
 }
+
+int runtime_gamepad_background(void) { return backgroundPads; }
 
 /* On-screen touch controls (iPhone, ios/app/Sources/touch_controls.m) feed a second state merged with the physical
    controllers: buttons are OR-ed (a tap shorter than one game frame is latched like a controller press), each stick

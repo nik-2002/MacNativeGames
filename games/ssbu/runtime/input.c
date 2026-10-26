@@ -39,6 +39,9 @@ void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pth
  if(press&&code==KEY_ASPECT_TOGGLE)runtime_aspect_toggle();}
 void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
 void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
+/* The window lost the keyboard: its held keys are forgotten (no key-up will come). Controllers that keep sending events
+   in the background (runtime_gamepad_background) stay as they are. */
+void runtime_input_focus_lost(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);if(!runtime_gamepad_background())runtime_gamepad_clear();}
 static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread_mutex_unlock(&inputLock);fprintf(stderr,"[ssbu] native keyboard controller initialized\n");}
 /* Docked: the keyboard and the first controller are one full-key controller as player 1 (id 0, style bit 0). Handheld
    (TOTK_OPERATION_MODE=handheld, the iPhone): the same input is the handheld controller (id 0x20, style bit 1, joy-cons
