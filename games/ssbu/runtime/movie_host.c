@@ -56,7 +56,8 @@ typedef struct {
     int format, configured, started, w, h, eos_in, format_sent, last_error;
     void **events;                       /* DecoderEvents: EventType* per EV_* */
     vpx_codec_ctx_t vpx; int vpx_live;
-    uint8_t *in[IN_BUFS]; int in_free[IN_BUFS], nin_free;
+    uint8_t *key; unsigned key_len; int need_key;   /* the clip's first key frame, for a loop that resumes after it */
+    uint8_t *in[IN_BUFS]; int in_free[IN_BUFS], nin_free; unsigned lent;   /* lent: input buffers the game holds */
     Pending pending[IN_BUFS]; int npending;
     uint8_t *out[OUT_BUFS]; int out_bytes[OUT_BUFS], out_held[OUT_BUFS];
     Ready ready[OUT_BUFS]; int nready;
@@ -191,6 +192,24 @@ void movie_host_tick(void) {   /* lock order g_lock -> Movie.mu, as in destroy; 
     fire(&s);
 }
 /* Decode one input into output slots; returns 0 when it had to wait for a free output slot. */
+/* An input buffer back to the game. Once each: a looping clip flushes the decoder and then sends buffers it had taken
+   before the flush as well, and the free list and the pending queue (just before out[] in Movie) used to run past their
+   ends; the queued times overwrote the frame pointers (a crash in the Help pages, 2026-10-26). */
+static void give_back(Movie *m, int index) {
+    for (int i = 0; i < m->nin_free; i++) if (m->in_free[i] == index) return;
+    if (index >= 0 && index < IN_BUFS && m->nin_free < IN_BUFS) m->in_free[m->nin_free++] = index;
+}
+static void queue_pending(Movie *m, const Pending *p) {
+    for (int i = 0; i < m->npending; i++) if (m->pending[i].index == p->index) {   /* the same buffer sent again: the new data wins */
+        static int told; if (told++ < 4) LOG("【红】input buffer %d sent again while queued (after a flush); the older data is dropped", p->index);
+        memmove(m->pending + i, m->pending + i + 1, (size_t)(--m->npending - i) * sizeof m->pending[0]); break;
+    }
+    for (int i = 0; i < m->nin_free; i++) if (m->in_free[i] == p->index) {   /* queued data is not the game's to refill */
+        memmove(m->in_free + i, m->in_free + i + 1, (size_t)(--m->nin_free - i) * sizeof m->in_free[0]); break;
+    }
+    if (m->npending >= IN_BUFS) runtime_fail("movie decoder: more queued inputs than input buffers");
+    m->pending[m->npending++] = *p;
+}
 static int decode_one(Movie *m, Signals *s, const Pending *p) {
     int need = p->size > 0 ? 1 : 0;
     if (p->flags & FLAG_EOS && !m->eos_in) need++;
@@ -198,7 +217,21 @@ static int decode_one(Movie *m, Signals *s, const Pending *p) {
     if (freeslots < need) return 0;
     if (p->size > 0) {
         uint64_t t0 = now_ns();
-        vpx_codec_err_t e = vpx_codec_decode(&m->vpx, m->in[p->index] + p->offset, (unsigned)p->size, NULL, 0);
+        const uint8_t *data = m->in[p->index] + p->offset;
+        vpx_codec_stream_info_t si = {.sz = sizeof si};
+        int kf = vpx_codec_peek_stream_info(vpx_codec_vp9_dx(), data, (unsigned)p->size, &si) == VPX_CODEC_OK && si.is_kf;
+        if (kf && (!m->key || p->time == 0)) {   /* keep the opening key frame */
+            uint8_t *k = realloc(m->key, (size_t)p->size); if (!k) runtime_fail("movie key frame copy");
+            memcpy(k, data, (size_t)p->size); m->key = k; m->key_len = (unsigned)p->size;
+        }
+        if (m->need_key && !kf && m->key) {   /* after a flush the game resumes a looping clip (Help > Techniques) at its
+            second frame; the console's decoder still holds the first, libvpx needs it decoded again (not shown) */
+            if (vpx_codec_decode(&m->vpx, m->key, m->key_len, NULL, 0) == VPX_CODEC_OK) {
+                vpx_codec_iter_t it = NULL; while (vpx_codec_get_frame(&m->vpx, &it)) {}
+            }
+        }
+        m->need_key = 0;
+        vpx_codec_err_t e = vpx_codec_decode(&m->vpx, data, (unsigned)p->size, NULL, 0);
         if (e != VPX_CODEC_OK) {
             m->errors++; m->last_error = ST_ERROR; note(m, s, EV_ERROR);
             if (m->errors <= 4) LOG("【红】VP9 decode error on a %d-byte frame at %lld us: %s", p->size, (long long)p->time, vpx_codec_error_detail(&m->vpx) ? vpx_codec_error_detail(&m->vpx) : vpx_codec_err_to_string(e));
@@ -232,7 +265,7 @@ static int decode_one(Movie *m, Signals *s, const Pending *p) {
         push_ready(m, s, slot, FLAG_EOS, p->time, 0);
         LOG("end of stream after %llu frames (%.2f ms per frame, %llu errors)", (unsigned long long)m->frames, m->frames ? m->decode_ns / 1e6 / (double)m->frames : 0.0, (unsigned long long)m->errors);
     }
-    m->in_free[m->nin_free++] = p->index; note(m, s, EV_INPUT);
+    give_back(m, p->index); note(m, s, EV_INPUT);
     return 1;
 }
 static void drain_pending(Movie *m, Signals *s) {
@@ -242,13 +275,16 @@ static void release_codec(Movie *m) {
     if (m->vpx_live) { vpx_codec_destroy(&m->vpx); m->vpx_live = 0; }
     for (int i = 0; i < IN_BUFS; i++) { free(m->in[i]); m->in[i] = NULL; }
     for (int i = 0; i < OUT_BUFS; i++) { free(m->out[i]); m->out[i] = NULL; }
+    free(m->key); m->key = NULL; m->key_len = 0; m->need_key = 0;
     /* no frame stays held: a looping menu clip resets at its end while the game still holds a frame, and reading it
        afterwards used to copy from the freed buffer (a crash some minutes into the menus) */
     memset(m->out_held, 0, sizeof m->out_held); memset(m->out_bytes, 0, sizeof m->out_bytes);
     m->configured = m->started = 0; m->nin_free = m->npending = m->nready = m->ndecoded = 0; m->t0 = 0;
 }
 static void reset_queues(Movie *m) {
-    m->nin_free = 0; for (int i = 0; i < IN_BUFS; i++) m->in_free[m->nin_free++] = i;
+    /* buffers the game holds stay the game's: a looping clip (Help > Techniques) fills one with its key frame before the
+       flush and sends it after */
+    m->nin_free = 0; for (int i = 0; i < IN_BUFS; i++) if (!(m->lent >> i & 1)) m->in_free[m->nin_free++] = i;
     memset(m->out_held, 0, sizeof m->out_held); m->npending = m->nready = m->ndecoded = 0; m->eos_in = 0; m->t0 = 0;
 }
 
@@ -304,7 +340,7 @@ static int h_configure(void *obj, void *format) {
     m->vpx_live = 1;
     for (int i = 0; i < IN_BUFS; i++) if (!(m->in[i] = malloc(IN_CAP))) runtime_fail("movie input buffers");
     for (int i = 0; i < OUT_BUFS; i++) if (!(m->out[i] = malloc((size_t)frame_bytes(m)))) runtime_fail("movie output buffers");
-    reset_queues(m); m->format_sent = 0; m->configured = 1; m->last_error = 0;
+    m->lent = 0; reset_queues(m); m->format_sent = 0; m->configured = 1; m->last_error = 0;
     pthread_mutex_unlock(&m->mu);
     LOG("configured %dx%d VP9, %d input buffers of %d KiB, %d output frames of %d bytes", w, h, IN_BUFS, IN_CAP >> 10, OUT_BUFS, frame_bytes(m));
     return ST_OK;
@@ -352,12 +388,11 @@ static int h_reset(void *obj) {
 static int h_flush(void *obj) {
     Movie *m = find(obj); if (!m) return ((int_fn)G.orig[MOVIE_FLUSH])(obj);
     pthread_mutex_lock(&m->mu);
-    if (m->configured) {   /* drop queued work; the next input starts a new decode (after a seek: a key frame) */
-        vpx_codec_destroy(&m->vpx); m->vpx_live = 0;
-        vpx_codec_dec_cfg_t cfg = {.threads = 4, .w = (unsigned)m->w, .h = (unsigned)m->h};
-        if (vpx_codec_dec_init(&m->vpx, vpx_codec_vp9_dx(), &cfg, 0) != VPX_CODEC_OK) runtime_fail("libvpx VP9 decoder re-initialisation");
-        m->vpx_live = 1; reset_queues(m);
-    }
+    LOG("flush after %llu frames (eos %d, %d queued, %d free inputs, %d frames ready)", (unsigned long long)m->frames, m->eos_in, m->npending, m->nin_free, m->nready);
+    /* drop queued work and take every input buffer back. The decoder keeps its pictures, as the console's does: a looping
+       clip (Help > Techniques) does not always resend its key frame after the flush, and a fresh decoder failed every frame
+       until the next loop. */
+    if (m->configured) { reset_queues(m); m->need_key = 1; }
     pthread_mutex_unlock(&m->mu);
     return ST_OK;
 }
@@ -368,7 +403,7 @@ static int h_acquire_input(void *obj, int *index, int *remaining) {
     pthread_mutex_lock(&m->mu);
     *index = -1; *remaining = 0; int st = ST_NO_INPUT;
     if (m->started && m->nin_free > 0) {
-        *index = m->in_free[0]; memmove(m->in_free, m->in_free + 1, (size_t)--m->nin_free * sizeof m->in_free[0]);
+        *index = m->in_free[0]; memmove(m->in_free, m->in_free + 1, (size_t)--m->nin_free * sizeof m->in_free[0]); m->lent |= 1u << *index;
         *remaining = m->nin_free; st = ST_OK;
     }
     pthread_mutex_unlock(&m->mu); return st;
@@ -390,9 +425,13 @@ static int h_send_input(void *obj, int index, int offset, int size, int64_t time
     Signals s = {0};
     pthread_mutex_lock(&m->mu);
     if (!m->started) { pthread_mutex_unlock(&m->mu); return ST_ERROR; }
+    m->lent &= ~(1u << index);
     Pending p = {index, offset, size, time, flags};
-    if (m->eos_in) { m->in_free[m->nin_free++] = index; note(m, &s, EV_INPUT); }   /* after end of stream: hand the buffer back */
-    else if (m->npending || !decode_one(m, &s, &p)) m->pending[m->npending++] = p;
+    if (getenv("SSBU_MOVIE_TRACE")) LOG("input %d: %d bytes at %lld us, flags %#x (eos %d, %d queued)", index, size, (long long)time, flags, m->eos_in, m->npending);
+    if (m->eos_in && size > 0 && !(flags & FLAG_EOS)) m->eos_in = 0;   /* data after the end: the clip starts over (a loop's key frame
+       can come after one more end of stream, sent before the game's reader rewound; dropping it broke the whole next loop) */
+    if (m->eos_in) { give_back(m, index); note(m, &s, EV_INPUT); }   /* after end of stream: hand the buffer back */
+    else if (m->npending || !decode_one(m, &s, &p)) queue_pending(m, &p);
     pthread_mutex_unlock(&m->mu); fire(&s);
     return ST_OK;
 }
@@ -418,7 +457,9 @@ static int h_get_output(void *obj, int index, void *buf) {
     if (index >= 0 && index < OUT_BUFS && m->out_held[index] && m->out[index]) {
         int bytes = m->out_bytes[index]; uint8_t *dst = G.buf_base(buf);
         if (!bytes) st = ST_OK;
-        else if (dst && G.buf_capacity(buf) >= (size_t)bytes) { memcpy(dst, m->out[index], (size_t)bytes); G.buf_set_range(buf, 0, bytes); st = ST_OK; }
+        else if ((uintptr_t)dst < 0x100000 || (uintptr_t)m->out[index] < 0x100000) {   /* never copy through a bad pointer */
+            static int told; if (told++ < 8) LOG("【红】output %d: no copy, buffer %p, frame %p, %d bytes (the game's buffer or the frame is gone)", index, (void *)dst, (void *)m->out[index], bytes);
+        } else if (G.buf_capacity(buf) >= (size_t)bytes) { memcpy(dst, m->out[index], (size_t)bytes); G.buf_set_range(buf, 0, bytes); st = ST_OK; }
         else LOG("【红】output buffer of %zu bytes for a %d-byte frame", G.buf_capacity(buf), bytes);
     }
     pthread_mutex_unlock(&m->mu); return st;

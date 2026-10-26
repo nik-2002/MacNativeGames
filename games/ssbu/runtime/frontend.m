@@ -588,6 +588,12 @@ int runtime_front_offline_page(const char *document_path){
   NSMutableString *css=[NSMutableString string];
   [css appendFormat:@"@font-face{font-family:keyhelpFont;src:url('%@nintendo-extension.ttf');unicode-range:U+E000-E1FF}"   /* family names ignore case */
    "@font-face{font-family:keyhelpFont;src:url('%@standard.ttf');unicode-range:U+0000-DFFF,U+F000-FFFF}",fonts,fonts];
+  /* Button glyphs in the pages' own fonts (Help captions: "A Select"): the Switch falls back to its extension font for
+     them, so each family gets that range from it */
+  for(NSString *family in @[@"MyFont",@"FontB",@"FontUB",@"FontB-Asia",@"FontUB-Asia",@"DFP_GB_H9",@"DFP_GB_HC",@"DFPT_B9",@"DFPT_BC",@"AsiaKBIGR",@"AsiaKGDU"])
+   [css appendFormat:@"@font-face{font-family:'%@';src:url('%@nintendo-extension.ttf');unicode-range:U+E000-E1FF}",family,fonts];
+  [css appendString:@"*:focus,*:focus-visible{outline:none!important}"
+   "html{font-family:keyhelpFont}"];   /* the NX browser's default font is the system font (Mode Guide captions name none) */   /* the NX browser draws no focus ring (the pages' own cursor shows the focus) */
   NSString *fontScript=[NSString stringWithFormat:@"(function(){var s=document.createElement('style');s.textContent=%@;document.documentElement.appendChild(s);})();",
    [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:css options:NSJSONWritingFragmentsAllowed error:nil] encoding:NSUTF8StringEncoding]];
   [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:fontScript injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
