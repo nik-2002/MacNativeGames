@@ -32,8 +32,9 @@ static const uint8_t lamps[8] = {0x1, 0x3, 0x7, 0xf, 0x9, 0x5, 0xd, 0x6};
    Switch controllers (Pro Controller, Joy-Con) and PlayStation ones (DualShock 4, DualSense) pair over Bluetooth Classic,
    so a controller held in pairing mode is found, paired and connected without System Settings; GameController then
    reports it as usual. Xbox controllers use Bluetooth LE, which macOS pairs only in System Settings › Bluetooth.
-   The search runs while the panel is open, a minute at most; anything that looks like a controller is paired at once,
-   as on the Switch. */
+   The search runs until the player says pairing is done (A or Return; B or Esc also stops it), ten minutes at most, so
+   several controllers can be paired one after another; anything that looks like a controller is paired at once, as on
+   the Switch. Ending the search goes back to the join screen and never closes it. */
 typedef NS_ENUM(int, PairState) { PairFound, PairPairing, PairConnecting, PairDone, PairFailed };
 @interface SSBUPairRow : NSObject
 @property(strong) IOBluetoothDevice *device;
@@ -77,7 +78,7 @@ static BOOL looks_like_controller(IOBluetoothDevice *d) {
     }
     if (!self.rows) self.rows = [NSMutableArray array];
     if (!self.pairs) self.pairs = [NSMutableArray array];
-    self.until = runtime_now_ns() + 60ULL * 1000000000ULL;
+    self.until = runtime_now_ns() + 600ULL * 1000000000ULL;
     [self search];
 }
 - (void)search {
@@ -149,6 +150,7 @@ static BOOL looks_like_controller(IOBluetoothDevice *d) {
 @property(strong) NSMutableArray<GCController *> *joined;
 @property int minPlayers, maxPlayers;
 @property NSRect pairButton;
+@property(copy) NSString *note;   /* after pairing: what was paired */
 @end
 
 static SSBUPadScreen *screen;
@@ -213,6 +215,8 @@ static void text(NSString *s, CGFloat size, NSFontWeight weight, NSColor *color,
     NSRect button = NSMakeRect(W / 2 - 150 * u, py, 300 * u, 40 * u);
     self.pairButton = button;
     if (!pairer.until && !pairer.problem) {
+        if (self.note) text(self.note, 15 * u, NSFontWeightMedium, [NSColor colorWithSRGBRed:0.45 green:1 blue:0.35 alpha:1],
+                            NSMakeRect(0, py + 52 * u, W, 22 * u), NSTextAlignmentCenter);
         NSBezierPath *bp = [NSBezierPath bezierPathWithRoundedRect:button xRadius:20 * u yRadius:20 * u];
         [[NSColor colorWithCalibratedWhite:1 alpha:0.1] setFill]; [bp fill];
         [[NSColor colorWithCalibratedWhite:1 alpha:0.3] setStroke]; bp.lineWidth = 1.5 * u; [bp stroke];
@@ -230,6 +234,14 @@ static void text(NSString *s, CGFloat size, NSFontWeight weight, NSColor *color,
                  14 * u, NSFontWeightRegular, dim, NSMakeRect(0, py + 30 * u, W, 20 * u), NSTextAlignmentCenter);
             text(@(TOTK_UI("Xbox 手柄请在 系统设置 › 蓝牙 中配对", "Xbox controllers pair in System Settings › Bluetooth")),
                  13 * u, NSFontWeightRegular, [NSColor colorWithCalibratedWhite:0.5 alpha:1], NSMakeRect(0, py + 52 * u, W, 20 * u), NSTextAlignmentCenter);
+            /* The confirmation: the search goes on until the player says every controller is paired. */
+            NSString *ask = @(TOTK_UI("还有手柄要配对就让它进入配对模式；全部配对完成后按 Ⓐ（或 Return）",
+                                      "Put any other controller in pairing mode now. When every controller you want is paired, press Ⓐ (or Return)"));
+            CGFloat ay = py + 80 * u + 24 * u * pairer.rows.count + 10 * u;
+            NSRect box = NSMakeRect(W / 2 - 420 * u, ay, 840 * u, 36 * u);
+            NSBezierPath *bp = [NSBezierPath bezierPathWithRoundedRect:box xRadius:18 * u yRadius:18 * u];
+            [[NSColor colorWithCalibratedWhite:1 alpha:0.1] setFill]; [bp fill];
+            text(ask, 15 * u, NSFontWeightSemibold, NSColor.whiteColor, NSMakeRect(box.origin.x, ay + 8 * u, box.size.width, 22 * u), NSTextAlignmentCenter);
         }
         CGFloat ry = py + 80 * u;
         for (SSBUPairRow *r in pairer.rows) {
@@ -247,17 +259,25 @@ static void text(NSString *s, CGFloat size, NSFontWeight weight, NSColor *color,
                                  : @(TOTK_UI("没有连接手柄：先在 系统设置 › 蓝牙 中配对", "No controllers connected: pair one in System Settings › Bluetooth"));
     text(status, 14 * u, NSFontWeightRegular, [NSColor colorWithCalibratedWhite:0.6 alpha:1], NSMakeRect(40 * u, H - 64 * u, W / 2, 22 * u), NSTextAlignmentLeft);
     BOOL can = (int)self.joined.count >= self.minPlayers;
-    NSString *keys = [NSString stringWithFormat:@"%@      %@", @(TOTK_UI("Ⓐ/○ 完成   Ⓑ/✕ 退出 / 取消   Ⓨ/□ 配对", "Ⓐ/○ Done   Ⓑ/✕ Leave / Cancel   Ⓨ/□ Pair")), @(TOTK_UI("Return 完成   Esc 取消   P 配对", "Return Done   Esc Cancel   P Pair"))];
+    NSString *keys = pairer.until || pairer.problem
+        ? [NSString stringWithFormat:@"%@      %@", @(TOTK_UI("Ⓐ/○ 配对完成   Ⓑ/✕ 停止配对", "Ⓐ/○ Done pairing   Ⓑ/✕ Stop pairing")), @(TOTK_UI("Return 配对完成   Esc 停止", "Return Done pairing   Esc Stop"))]
+        : [NSString stringWithFormat:@"%@      %@", @(TOTK_UI("Ⓐ/○ 完成   Ⓑ/✕ 退出 / 取消   Ⓨ/□ 配对", "Ⓐ/○ Done   Ⓑ/✕ Leave / Cancel   Ⓨ/□ Pair")), @(TOTK_UI("Return 完成   Esc 取消   P 配对", "Return Done   Esc Cancel   P Pair"))];
     text(keys, 15 * u, NSFontWeightMedium, [NSColor colorWithCalibratedWhite:can ? 0.92 : 0.5 alpha:1], NSMakeRect(W / 2, H - 64 * u, W / 2 - 40 * u, 22 * u), NSTextAlignmentRight);
 }
 @end
 
 static NSTimer *ticker;
 static void redraw(void) { screen.needsDisplay = YES; }
+static BOOL pairing(void) { return pairer.until || pairer.problem; }
 static void pair_toggle(void) {   /* main queue */
     if (!screen) return;
     if (!pairer) pairer = [SSBUPairer new];
-    if (pairer.until || pairer.problem) [pairer stop]; else [pairer start];
+    if (pairing()) {
+        int n = 0; for (SSBUPairRow *r in pairer.rows) n += r.state == PairDone;
+        screen.note = n ? [NSString stringWithFormat:@(TOTK_UI("已配对 %d 个手柄：在每个手柄上按 L + R 加入", "%d controller(s) paired: press L + R on each to join")), n] : nil;
+        fprintf(stderr, "[ssbu-input] pairing done: %d controller(s) paired\n", n);
+        [pairer stop];
+    } else { screen.note = nil; [pairer start]; }
     if (pairer.until && !ticker) ticker = [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *t) {
         if (!screen || (!pairer.until && !pairer.searching)) { [t invalidate]; ticker = nil; }
         else if (pairer.until && runtime_now_ns() > pairer.until && !pairer.searching) { pairer.until = 0; }
@@ -300,7 +320,8 @@ static void open_screen(int min_players, int max_players) {   /* main queue */
     keyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
         if (e.modifierFlags & NSEventModifierFlagCommand) return e;
         if (e.type == NSEventTypeKeyDown && !e.ARepeat) {
-            if (e.keyCode == 36 || e.keyCode == 76) finish(YES);
+            if (pairing() && (e.keyCode == 36 || e.keyCode == 76 || e.keyCode == 53)) pair_toggle();   /* done / stop pairing */
+            else if (e.keyCode == 36 || e.keyCode == 76) finish(YES);
             else if (e.keyCode == 53) finish(NO);
             else if (e.keyCode == 35) pair_toggle();   /* P */
         }
@@ -311,7 +332,9 @@ static void open_screen(int min_players, int max_players) {   /* main queue */
 
 static void screen_input(GCController *c, uint64_t b) {   /* main queue */
     if (!held) held = [NSMapTable weakToStrongObjectsMapTable];
-    uint64_t prev = [held objectForKey:c].unsignedLongLongValue, edge = b & ~prev;
+    NSNumber *seen = [held objectForKey:c];
+    uint64_t prev = seen.unsignedLongLongValue, edge = seen ? b & ~prev : 0;   /* a controller's first report is no press:
+        one that just connected may still hold its pairing buttons (Share + PS, the sync button's neighbours) */
     [held setObject:@(b) forKey:c];
     if (!screen) {
         /* − and + held together for a second open the screen. */
@@ -334,6 +357,10 @@ static void screen_input(GCController *c, uint64_t b) {   /* main queue */
         c.playerIndex = i < 4 ? (GCControllerPlayerIndex)(GCControllerPlayerIndex1 + i) : GCControllerPlayerIndexUnset;
         fprintf(stderr, "[ssbu-input] controller screen: %s joined as player %d\n", (c.vendorName ?: @"unknown").UTF8String, i + 1);
         screen.needsDisplay = YES;
+        return;
+    }
+    if (pairing()) {   /* A says pairing is done, B stops it: back to the join screen, never closing it */
+        if (edge & (B_A | B_B) && !join) pair_toggle();
         return;
     }
     if (!micro && (edge & B_Y)) { pair_toggle(); return; }

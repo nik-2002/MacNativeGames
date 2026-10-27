@@ -112,8 +112,9 @@ to the player the game vibrates. `SSBU_MERGE_PADS=1` makes every controller driv
   the next player, and its lamps show which. A on a joined controller is done, B leaves (B with nobody joined cancels);
   Return / Esc on the keyboard. Controllers that did not join follow the ones that did. PlayStation: L1 + R1, Xbox: LB + RB;
   buttons go by position (A = the right face button, ○ on PlayStation).
-- **Pair new controller** on that screen (Y / □, P, or click): searches for a minute and pairs and connects any controller
-  held in pairing mode, no System Settings needed. Switch Pro Controller and Joy-Con: hold the sync button; DualShock 4:
+- **Pair new controller** on that screen (Y / □, P, or click): searches and pairs and connects every controller put in
+  pairing mode, one after another, no System Settings needed, until you press A / Return to say pairing is done (B / Esc
+  stops it too); either goes back to the join screen, which stays open. Switch Pro Controller and Joy-Con: hold the sync button; DualShock 4:
   Share + PS; DualSense: Create + PS. Xbox controllers use Bluetooth LE and pair in System Settings › Bluetooth. The first
   search asks once for Bluetooth access.
 - Controllers keep playing while another app or window is in front (the game on a TV, the Mac's own screen in use).

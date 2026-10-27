@@ -41,13 +41,16 @@
   and + held for a second, and when the game calls `nn::hid::ShowControllerSupport`, which now waits for it as on the
   console (it used to return at once). The game gets no controller input while it is open, and none after it until
   every button is let go. Test lines: `pads open|done|cancel|pair|press <bits>|shot <png>|applet <min> <max>`.
-- **Pair new controller** (Y, P or a click): an IOBluetooth search, repeated for a minute, pairs anything whose class of
+- **Pair new controller** (Y, P or a click): an IOBluetooth search, repeated until the player confirms pairing is done
+  (A / Return; B / Esc stops; ten minutes at most), pairs anything whose class of
   device is a gamepad or joystick (or whose name says controller) and opens its connection; GameController then reports
   it. Pairing requests are answered (confirmation yes, PIN 0000). Switch and PlayStation controllers are Bluetooth
   Classic; Xbox controllers are Bluetooth LE, which only System Settings pairs, and the screen says so. A turned-off radio
   or a refused permission is shown instead of a search. The app's Info.plist carries `NSBluetoothAlwaysUsageDescription`
   (without it macOS ends the process on the first Bluetooth call); the app needs `make app` or the line added and a
-  re-sign. Checked: the search runs and repeats, and the user's Pro Controller, paired before, was found and connected.
+  re-sign. Ending pairing returns to the join screen and never closes it, with a line saying how many were paired; a
+  controller's first report after it connects counts as no press, so buttons still held from its pairing combo cannot
+  cancel or finish the screen. Checked: the search runs and repeats, and the user's Pro Controller, paired before, was found and connected.
 
 ### Portable app
 
