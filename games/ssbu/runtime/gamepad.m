@@ -190,6 +190,20 @@ static int choose_slot(GCController *controller) {
     return -1;
 }
 
+/* macOS binds Home (and Share, Options) to its own gestures: Home opens the Game Overlay. The game asks for Home
+   (GCSystemGestureStateDisabled) when a controller connects and again whenever its window becomes active, since a
+   request made before the app is frontmost (the controllers already connected at start) may not be kept. */
+static void claim_home(GCController *controller) {
+    GCControllerButtonInput *home = controller.physicalInputProfile.buttons[GCInputButtonHome];
+    if (!home) return;
+    home.preferredSystemGestureState = GCSystemGestureStateDisabled;
+    fprintf(stderr, "[ssbu-input] %s: Home asked for (state %ld, %s)\n", (controller.vendorName ?: @"controller").UTF8String,
+            (long)home.preferredSystemGestureState, home.boundToSystemGesture ? "macOS still binds it to a gesture" : "not bound to a gesture");
+}
+void runtime_pads_claim_home(void) {   /* main queue: the window became active */
+    for (GCController *c in GCController.controllers) claim_home(c);
+}
+
 static void attach_gamepad(GCController *controller) {   /* main queue */
     GCExtendedGamepad *pad = controller.extendedGamepad;
     GCMicroGamepad *micro = pad ? nil : controller.microGamepad;
@@ -204,7 +218,7 @@ static void attach_gamepad(GCController *controller) {   /* main queue */
     show_player(controller, slot);
     /* The Home button (8BitDo's heart, the PS and Xbox buttons) opens the controller screen (pad_screen.m): taken from
        macOS, which otherwise keeps it for its own controller overlay. */
-    if (pad.buttonHome) pad.buttonHome.preferredSystemGestureState = GCSystemGestureStateDisabled;
+    claim_home(controller);
     controller.handlerQueue = padQueue;
     __weak GCController *weak = controller;
     void (^changed)(void) = ^{ GCController *c = weak; int now = c ? slot_of(c) : -1; if (now >= 0) refresh_slot(now); if (c) runtime_pad_screen_input(c); };

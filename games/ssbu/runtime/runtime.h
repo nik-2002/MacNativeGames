@@ -168,6 +168,7 @@ NSArray<GCController *> *runtime_pads_connected(void);
 void runtime_pads_reorder(NSArray<GCController *> *order);
 void runtime_pads_show_lights(void);
 #endif
+void runtime_pads_claim_home(void);   /* the window became active: ask macOS for the controllers' Home buttons again */
 void runtime_pad_screen_open(void);                       /* the shortcut (⌘K, or hold − and + on a controller) */
 int runtime_pad_screen_run(int min_players, int max_players);
 void runtime_pad_screen_test(const char *op);   /* the input file's "pads ..." lines */   /* the game's ShowControllerSupport: waits; players joined */
