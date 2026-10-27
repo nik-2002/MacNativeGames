@@ -107,8 +107,8 @@ Controllers: every controller macOS sees (Switch Pro, DualSense, Xbox and others
 connect; the first one shares player 1 with the keyboard. Players 1–4 light their controller's player lamps. Rumble goes
 to the player the game vibrates. `SSBU_MERGE_PADS=1` makes every controller drive player 1 instead.
 
-- **Controller screen** (the Switch's Change Grip/Order): ⌘K, holding − and + on a controller for a second, or the game
-  asking for it. Each controller presses L + R (or ZL + ZR; a single Joy-Con sideways: its two buttons together) to take
+- **Controller screen** (the Switch's Change Grip/Order): ⌘K, holding − and + on a controller for a second, a
+  controller's Home button (8BitDo's heart, the PS or Xbox button; it closes the screen again), or the game asking for it. Each controller presses L + R (or ZL + ZR; a single Joy-Con sideways: its two buttons together) to take
   the next player, and its lamps show which. A on a joined controller is done, B leaves (B with nobody joined cancels);
   Return / Esc on the keyboard. Controllers that did not join follow the ones that did. PlayStation: L1 + R1, Xbox: LB + RB;
   buttons go by position (A = the right face button, ○ on PlayStation).

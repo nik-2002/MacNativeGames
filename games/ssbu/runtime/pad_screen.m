@@ -2,7 +2,8 @@
    a single Joy-Con held sideways: its two buttons together) takes the next player, its lights show which, A on a joined
    controller is done, B leaves (B with nobody joined cancels). Return is done and Esc cancels on the keyboard, which stays
    with player 1. The game opens it through nn::hid::ShowControllerSupport and waits for it, as on the console; ⌘K or
-   holding − and + on a controller for a second opens it any time. Done gives the players in the order they joined,
+   holding − and + on a controller for a second, or a controller's Home button (8BitDo's heart, the PS or Xbox button),
+   opens it any time; Home closes it again as Done. Done gives the players in the order they joined,
    the controllers that did not join after them; cancel leaves the players as they were. */
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
@@ -17,7 +18,7 @@
 void *runtime_front_content_view(void);   /* frontend.m */
 uint64_t runtime_pads_buttons(GCController *controller);   /* gamepad.m: the Switch buttons it holds */
 
-enum { B_A = 1 << 0, B_B = 1 << 1, B_Y = 1 << 3, B_L = 1 << 6, B_R = 1 << 7, B_ZL = 1 << 8, B_ZR = 1 << 9, B_PLUS = 1 << 10, B_MINUS = 1 << 11 };
+enum { B_A = 1 << 0, B_B = 1 << 1, B_Y = 1 << 3, B_L = 1 << 6, B_R = 1 << 7, B_ZL = 1 << 8, B_ZR = 1 << 9, B_PLUS = 1 << 10, B_MINUS = 1 << 11, B_HOME = 1 << 18 };   /* B_HOME: ours, not a Switch button */
 
 /* Smash's player colours, P1-P8. */
 static NSColor *player_color(int i) {
@@ -336,6 +337,8 @@ static void screen_input(GCController *c, uint64_t b) {   /* main queue */
     uint64_t prev = seen.unsignedLongLongValue, edge = seen ? b & ~prev : 0;   /* a controller's first report is no press:
         one that just connected may still hold its pairing buttons (Share + PS, the sync button's neighbours) */
     [held setObject:@(b) forKey:c];
+    /* Home (8BitDo's heart) opens the screen, and closes it again as Done. */
+    if (edge & B_HOME) { if (screen) finish(YES); else open_screen(0, RUNTIME_GAMEPAD_SLOTS); return; }
     if (!screen) {
         /* − and + held together for a second open the screen. */
         const uint64_t pm = B_PLUS | B_MINUS;
@@ -375,7 +378,7 @@ static void screen_input(GCController *c, uint64_t b) {   /* main queue */
 }
 
 void runtime_pad_screen_input(GCController *c) {   /* gamepad queue */
-    uint64_t b = runtime_pads_buttons(c);
+    uint64_t b = runtime_pads_buttons(c) | (c.extendedGamepad.buttonHome.isPressed ? B_HOME : 0);
     dispatch_async(dispatch_get_main_queue(), ^{ screen_input(c, b); });
 }
 

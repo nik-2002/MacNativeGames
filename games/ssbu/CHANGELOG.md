@@ -41,6 +41,9 @@
   and + held for a second, and when the game calls `nn::hid::ShowControllerSupport`, which now waits for it as on the
   console (it used to return at once). The game gets no controller input while it is open, and none after it until
   every button is let go. Test lines: `pads open|done|cancel|pair|press <bits>|shot <png>|applet <min> <max>`.
+- **Home opens it:** a controller's Home button (8BitDo's heart, the PS and Xbox buttons) opens the screen and closes it
+  again as Done. The game takes the button from macOS (`preferredSystemGestureState` disabled), which otherwise keeps
+  it for its controller overlay.
 - **Pair new controller** (Y, P or a click): an IOBluetooth search, repeated until the player confirms pairing is done
   (A / Return; B / Esc stops; ten minutes at most), pairs anything whose class of
   device is a gamepad or joystick (or whose name says controller) and opens its connection; GameController then reports

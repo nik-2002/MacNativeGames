@@ -202,6 +202,9 @@ static void attach_gamepad(GCController *controller) {   /* main queue */
         return;
     }
     show_player(controller, slot);
+    /* The Home button (8BitDo's heart, the PS and Xbox buttons) opens the controller screen (pad_screen.m): taken from
+       macOS, which otherwise keeps it for its own controller overlay. */
+    if (pad.buttonHome) pad.buttonHome.preferredSystemGestureState = GCSystemGestureStateDisabled;
     controller.handlerQueue = padQueue;
     __weak GCController *weak = controller;
     void (^changed)(void) = ^{ GCController *c = weak; int now = c ? slot_of(c) : -1; if (now >= 0) refresh_slot(now); if (c) runtime_pad_screen_input(c); };
