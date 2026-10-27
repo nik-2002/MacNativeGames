@@ -14,6 +14,9 @@
 - **Graphics:** an NVN function the port lacks (83 of 523: debug, GL interop, transform feedback, tessellation, getters)
   is logged once and returns 0 instead of ending the game (`DM_NVN_STRICT=1`: stop). Integer clears (`ClearColori`,
   `ClearColorui`, `ClearTexturei`) are implemented.
+- **Leaving Training:** the game makes its amiibo availability event again at the same address after destroying the old
+  one. The event binding table still held the old entry, so the new event was never created and the system library's
+  `ClearSystemEvent` stopped the game. A binding is now dropped when its event's handle is closed.
 - **Shaders:** a shader that fails to translate, a translator that exits, or a translation Metal cannot compile skips the
   draws that need it instead of ending the game; a new translator starts for the next shader. A dead translator's pipe no
   longer raises SIGPIPE (which ended the game without a log).

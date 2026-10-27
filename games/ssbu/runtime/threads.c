@@ -85,6 +85,7 @@ static void *h_peek(uint32_t h, int type) {      // 只查不报 | Lookup only, 
     if (i == 0 || i >= MAX_H || g_h[i].type != type) return NULL;
     return g_h[i].obj;
 }
+static void se_forget(uint32_t wh);   /* below, with the service-layer SystemEvents */
 static void *h_get(uint32_t h, int type) {       // 查不到即报（句柄错是真错误） | Reports if not found (a wrong handle is a real error)
     void *o = h_peek(h, type);
     if (!o) LOG("句柄无效 %#x（要类型 %d）", h, type);
@@ -551,6 +552,7 @@ int svc_thread(int num, uint64_t *regs) {
         unsigned i = (uint32_t)regs[0] - 0x1000;int valid=0;
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
             valid=1;event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
+            if (g_h[i].type == O_EVENT_W) se_forget((uint32_t)regs[0]);
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
         } else if (i > 0 && i < MAX_H && (g_h[i].type == O_SESSION || g_h[i].type == O_TMEM)) {
             valid=1;void *o = g_h[i].obj; int session = g_h[i].type == O_SESSION;
@@ -580,6 +582,14 @@ int svc_thread(int num, uint64_t *regs) {
 static struct { void *ev; uint32_t wh; } g_se[512];
 static int g_nse;
 static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
+/* An event the game destroyed (DestroySystemEvent closes its writable handle) leaves the binding table: the game's next
+   SystemEventType often sits at the same address (nfp's availability event, made again on leaving Training), and a stale
+   entry left it uncreated, so the SDK's ClearSystemEvent stopped the game on its state check. */
+static void se_forget(uint32_t wh) {
+    pthread_mutex_lock(&g_se_lock);
+    for (int i = 0; i < g_nse; i++) if (g_se[i].wh == wh) { g_se[i] = g_se[--g_nse]; break; }
+    pthread_mutex_unlock(&g_se_lock);
+}
 static uint32_t se_find(void *ev) {
     for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
     return 0;
