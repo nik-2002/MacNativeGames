@@ -22,6 +22,7 @@ typedef struct {
     uint64_t tapUntil[CONTROLLER_BUTTONS];   /* ns, for tap */
     int toggleOn[CONTROLLER_BUTTONS];        /* for toggle */
     int toggleMoved[CONTROLLER_BUTTONS];     /* the stick moved since the toggle went on */
+    int mute;                                /* the controller screen closed: nothing for the game until all is let go */
 } PadSlot;
 static PadSlot slots[RUNTIME_GAMEPAD_SLOTS];             /* gamepadLock */
 static __weak GCController *slotOwner[RUNTIME_GAMEPAD_SLOTS];   /* written on the main queue */
@@ -33,6 +34,7 @@ static uint64_t slotLeftAt[RUNTIME_GAMEPAD_SLOTS];       /* main queue, ns */
    manual page there no longer hold back or bunch up the buttons. */
 static dispatch_queue_t padQueue;
 static int mergePads, backgroundPads;
+static _Atomic int screenOpen;   /* the controller screen (pad_screen.m) has the controllers: the game gets nothing */
 static void refresh_slot(int slot);
 
 /* The player's button layout (controller_map.h): TOTK_CONTROLS names the file (the launcher: <data>/controls.txt and
@@ -123,6 +125,13 @@ static void refresh_slot(int slot) {
         next.rx = stronger_axis(next.rx, rx); next.ry = stronger_axis(next.ry, ry);
     }
     pthread_mutex_lock(&gamepadLock);   /* the mode state below is also reset by runtime_gamepad_clear */
+    if (screenOpen || p->mute) {
+        if (!physical) p->mute = 0;
+        p->physicalPrev = physical;
+        p->state = (RuntimeGamepadState){.connected = next.connected};
+        pthread_mutex_unlock(&gamepadLock);
+        return;
+    }
     /* Modes work on the physical buttons, not on the mapped ones: two physical buttons may share a Switch button
        (X and L3 both running), and a mapped edge would be lost while the other one is held. */
     uint64_t now = runtime_now_ns(), edges = physical & ~p->physicalPrev, synthetic = 0, suppressed = 0;
@@ -195,7 +204,7 @@ static void attach_gamepad(GCController *controller) {   /* main queue */
     show_player(controller, slot);
     controller.handlerQueue = padQueue;
     __weak GCController *weak = controller;
-    void (^changed)(void) = ^{ GCController *c = weak; int now = c ? slot_of(c) : -1; if (now >= 0) refresh_slot(now); };
+    void (^changed)(void) = ^{ GCController *c = weak; int now = c ? slot_of(c) : -1; if (now >= 0) refresh_slot(now); if (c) runtime_pad_screen_input(c); };
     if (pad) pad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *e) { (void)g; (void)e; changed(); };
     else micro.valueChangedHandler = ^(GCMicroGamepad *g, GCControllerElement *e) { (void)g; (void)e; changed(); };
     fprintf(stderr, "[ssbu-input] native gamepad connected as player %d: %s (%s), face buttons by %s\n", slot + 1,
@@ -239,6 +248,45 @@ void runtime_gamepad_start(void) {
                    usingBlock:^(NSNotification *notification) { detach_gamepad(notification.object); }];
     for (GCController *controller in GCController.controllers) attach_gamepad(controller);
     [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
+}
+
+/* ---- the controller screen (runtime/pad_screen.m) ---- */
+void runtime_pads_hold(int on) {   /* main queue */
+    screenOpen = on;
+    if (!on) { pthread_mutex_lock(&gamepadLock); for (int s = 0; s < RUNTIME_GAMEPAD_SLOTS; s++) slots[s].mute = 1; pthread_mutex_unlock(&gamepadLock); }
+    dispatch_async(padQueue, ^{ for (int s = 0; s < RUNTIME_GAMEPAD_SLOTS; s++) refresh_slot(s); });
+}
+uint64_t runtime_pads_buttons(GCController *controller) {   /* gamepad queue: the Switch buttons it holds, after the layout */
+    GCExtendedGamepad *pad = controller.extendedGamepad;
+    GCMicroGamepad *micro = pad ? nil : controller.microGamepad;
+    uint64_t physical = pad ? gamepad_buttons(pad, face_by_position(controller))
+                      : micro ? (micro.buttonA.isPressed ? 2ULL : 0) | (micro.buttonX.isPressed ? 1ULL : 0) | (micro.buttonMenu.isPressed ? 1ULL << 10 : 0) : 0;
+    return controller_map_apply(controllerMap, physical);
+}
+int runtime_pads_slot_of(GCController *controller) { return slot_of(controller); }   /* main queue */
+NSArray<GCController *> *runtime_pads_connected(void) {   /* main queue: by player */
+    NSMutableArray *out = [NSMutableArray array];
+    for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS; i++) if (slotOwner[i]) [out addObject:slotOwner[i]];
+    for (GCController *c in GCController.controllers) if ((c.extendedGamepad || c.microGamepad) && ![out containsObject:c]) [out addObject:c];
+    return out;
+}
+/* The players in the order the screen made: order[i] is player i + 1, the controllers that did not join follow. */
+void runtime_pads_reorder(NSArray<GCController *> *order) {   /* main queue */
+    if (mergePads) return;
+    NSMutableArray<GCController *> *all = [order mutableCopy];
+    for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS; i++) if (slotOwner[i] && ![all containsObject:slotOwner[i]]) [all addObject:slotOwner[i]];
+    for (GCController *c in all) runtime_feedback_detach(c);
+    for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS; i++) slotOwner[i] = nil;
+    for (NSUInteger i = 0; i < all.count && i < RUNTIME_GAMEPAD_SLOTS; i++) {
+        GCController *c = all[i]; int slot = (int)i;
+        slotOwner[slot] = c; signature(c, slotLast[slot]); slotLeftAt[slot] = 0;
+        show_player(c, slot); runtime_feedback_attach(c, slot);
+        fprintf(stderr, "[ssbu-input] controller screen: player %d is %s\n", slot + 1, (c.vendorName ?: @"unknown").UTF8String);
+    }
+    dispatch_async(padQueue, ^{ for (int s = 0; s < RUNTIME_GAMEPAD_SLOTS; s++) refresh_slot(s); });
+}
+void runtime_pads_show_lights(void) {   /* main queue: every controller's lights back to its player */
+    for (int i = 0; i < RUNTIME_GAMEPAD_SLOTS; i++) if (slotOwner[i]) show_player(slotOwner[i], i);
 }
 
 void runtime_gamepad_clear(void) {

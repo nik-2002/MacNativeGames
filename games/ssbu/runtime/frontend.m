@@ -193,9 +193,20 @@ static TOTKWindowDelegate *windowDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
 void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
 /* Use the window-close path, not terminate:, so Command-Q also waits for active saves. */
+void *runtime_front_content_view(void){return (__bridge void *)window.contentView;}   /* pad_screen.m */
+@interface TOTKMenuTarget:NSObject
+@end
+@implementation TOTKMenuTarget
+-(void)controllers:(id)sender{(void)sender;runtime_pad_screen_open();}
+@end
+static TOTKMenuTarget *menuTarget;
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
  NSMenuItem *appItem=[NSMenuItem new];appItem.submenu=appMenu;[menu addItem:appItem];
+ /* ⌘K: the controller screen (runtime/pad_screen.m), as the Switch's Controllers > Change Grip/Order. */
+ menuTarget=[TOTKMenuTarget new];
+ NSMenuItem *pads=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("手柄…","Controllers…")) action:@selector(controllers:) keyEquivalent:@"k"];
+ pads.keyEquivalentModifierMask=NSEventModifierFlagCommand;pads.target=menuTarget;[appMenu addItem:pads];[appMenu addItem:[NSMenuItem separatorItem]];
  NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 Super Smash Bros. Ultimate","Quit Super Smash Bros. Ultimate")) action:@selector(performClose:) keyEquivalent:@"q"];
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
  [appMenu addItem:quit];NSApp.mainMenu=menu;

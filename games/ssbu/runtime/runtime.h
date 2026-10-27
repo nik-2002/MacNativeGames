@@ -159,4 +159,15 @@ void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 @class GCController;
 void runtime_feedback_attach(GCController *controller, int slot);
 void runtime_feedback_detach(GCController *controller);
+/* The controller screen (runtime/pad_screen.m: the Switch's Change Grip/Order, press L + R to join). */
+@class NSArray<ObjectType>;
+void runtime_pad_screen_input(GCController *controller);   /* gamepad queue: a controller changed */
+void runtime_pads_hold(int on);                            /* 1: the game gets no controller input; 0: back, once let go */
+int runtime_pads_slot_of(GCController *controller);
+NSArray<GCController *> *runtime_pads_connected(void);
+void runtime_pads_reorder(NSArray<GCController *> *order);
+void runtime_pads_show_lights(void);
 #endif
+void runtime_pad_screen_open(void);                       /* the shortcut (⌘K, or hold − and + on a controller) */
+int runtime_pad_screen_run(int min_players, int max_players);
+void runtime_pad_screen_test(const char *op);   /* the input file's "pads ..." lines */   /* the game's ShowControllerSupport: waits; players joined */

@@ -34,6 +34,14 @@
   stood in for); D-pad navigation moves to the item in line; no focus ring; the Switch font is the page default and
   button glyphs render. Y Help fades to black at once and its web process is started ahead.
 
+### Controller screen
+
+- The Switch's Change Grip/Order over the game (`runtime/pad_screen.m`): press L + R to take the next player, P1-P8 cards
+  in Smash's player colours with the controller's name and lamp pattern, A done, B leave or cancel. It opens on ⌘K, on −
+  and + held for a second, and when the game calls `nn::hid::ShowControllerSupport`, which now waits for it as on the
+  console (it used to return at once). The game gets no controller input while it is open, and none after it until
+  every button is let go. Test lines: `pads open|done|cancel|press <bits>|shot <png>|applet <min> <max>`.
+
 ### Portable app
 
 - The app can live on a USB drive: the game data is inside it and found from the app's own place, while saves, the shader

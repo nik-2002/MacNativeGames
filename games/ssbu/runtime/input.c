@@ -109,8 +109,12 @@ static void keyboard_state(KeyboardState *out){if(!out)runtime_fail("keyboard ou
    the controller in use (ControllerSupportResultInfo: int8 player count, 3 bytes padding, uint32 selected id). */
 typedef struct{int8_t players;uint8_t pad[3];uint32_t selected;} ControllerSupportResult;
 _Static_assert(sizeof(ControllerSupportResult)==8,"controller support result ABI");
+/* With controllers connected the controller screen (pad_screen.m) shows, and the game waits for it as for the applet.
+   ControllerSupportArg starts {int8 min players, int8 max players, bool take over connection, bool left justify,
+   bool permit Joy-Con dual, bool single mode, ...}. */
 static uint32_t show_controller_support(ControllerSupportResult *out,const void *arg){
- (void)arg;int players=1;for(uint32_t i=1;i<RUNTIME_GAMEPAD_SLOTS;i++)players+=extra_slot(i)>=0;
+ if(arg){const int8_t *a=arg;int lo=a[0],hi=a[5]?1:a[1];fprintf(stderr,"[ssbu] controller support applet asked: %d-%d players%s\n",lo,hi,a[5]?" (single mode)":"");runtime_pad_screen_run(lo,hi);}
+ int players=1;for(uint32_t i=1;i<RUNTIME_GAMEPAD_SLOTS;i++)players+=extra_slot(i)>=0;
  if(out)*out=(ControllerSupportResult){.players=(int8_t)players,.selected=pad_id()};
  static int last;if(players!=last){last=players;fprintf(stderr,"[ssbu] controller support applet: %d player(s), selected controller %#x\n",players,pad_id());}
  return 0;
@@ -267,6 +271,8 @@ static void *input_file(void *arg) {
             runtime_frame_step_pin(ms);
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
+        } else if (!strncmp(line, "pads ", 5)) {   /* "pads open|done|cancel|applet <min> <max>": the controller screen (pad_screen.m) */
+            line[strcspn(line, "\r\n")] = 0; runtime_pad_screen_test(line + 5);
         } else if (!strncmp(line, "page ", 5)) {   /* "page shot <path>" / "page frame" / "page back" / "page close" / "page pad <npad bits>": the open manual page */
             line[strcspn(line, "\r\n")] = 0; runtime_front_offline_test(line + 5);
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }

@@ -107,6 +107,10 @@ Controllers: every controller macOS sees (Switch Pro, DualSense, Xbox and others
 connect; the first one shares player 1 with the keyboard. Players 1–4 light their controller's player lamps. Rumble goes
 to the player the game vibrates. `SSBU_MERGE_PADS=1` makes every controller drive player 1 instead.
 
+- **Controller screen** (the Switch's Change Grip/Order): ⌘K, holding − and + on a controller for a second, or the game
+  asking for it. Each controller presses L + R (or ZL + ZR; a single Joy-Con sideways: its two buttons together) to take
+  the next player, and its lamps show which. A on a joined controller is done, B leaves (B with nobody joined cancels);
+  Return / Esc on the keyboard. Controllers that did not join follow the ones that did.
 - Controllers keep playing while another app or window is in front (the game on a TV, the Mac's own screen in use).
 - A controller that drops out (sleep, battery, Bluetooth) comes back as the same player; for two minutes a different new
   controller does not take that player's place.
@@ -127,6 +131,7 @@ Y Help opens the game's own manual pages over the game; B or Escape goes back an
 | `SSBU_DLC=0` | Report no add-ons. |
 | `SSBU_MERGE_PADS=1` | All controllers drive player 1. |
 | `SSBU_BACKGROUND_PADS=0` | Controllers play only while the game is the frontmost app. |
+| `SSBU_PAD_SCREEN=0` | The game's own requests for the controller screen return at once instead of showing it. |
 | `DM_NVN_STRICT=1` | Stop at the first graphics call the port does not implement (otherwise logged once and skipped). |
 | `SSBU_WARM_BEFORE_START=0` | Start the game after the title shaders only (the old, stuttery order). |
 | `SSBU_SHADER_PREFETCH=0` | Do not translate shaders when the game loads them. |
