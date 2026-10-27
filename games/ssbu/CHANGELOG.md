@@ -40,7 +40,14 @@
   in Smash's player colours with the controller's name and lamp pattern, A done, B leave or cancel. It opens on ⌘K, on −
   and + held for a second, and when the game calls `nn::hid::ShowControllerSupport`, which now waits for it as on the
   console (it used to return at once). The game gets no controller input while it is open, and none after it until
-  every button is let go. Test lines: `pads open|done|cancel|press <bits>|shot <png>|applet <min> <max>`.
+  every button is let go. Test lines: `pads open|done|cancel|pair|press <bits>|shot <png>|applet <min> <max>`.
+- **Pair new controller** (Y, P or a click): an IOBluetooth search, repeated for a minute, pairs anything whose class of
+  device is a gamepad or joystick (or whose name says controller) and opens its connection; GameController then reports
+  it. Pairing requests are answered (confirmation yes, PIN 0000). Switch and PlayStation controllers are Bluetooth
+  Classic; Xbox controllers are Bluetooth LE, which only System Settings pairs, and the screen says so. A turned-off radio
+  or a refused permission is shown instead of a search. The app's Info.plist carries `NSBluetoothAlwaysUsageDescription`
+  (without it macOS ends the process on the first Bluetooth call); the app needs `make app` or the line added and a
+  re-sign. Checked: the search runs and repeats, and the user's Pro Controller, paired before, was found and connected.
 
 ### Portable app
 

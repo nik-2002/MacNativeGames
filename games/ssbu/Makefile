@@ -42,7 +42,7 @@ $(OUT)/ssbu-native: $(RUNTIME_SRC) $(RUNTIME_HEADERS) $(GENERATED) $(GFX_OBJECTS
 	  $(RUNTIME_SRC) $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a \
 	  -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics \
 	  -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation \
-	  -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -framework WebKit -o "$@"
+	  -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -framework WebKit -framework IOBluetooth -framework CoreBluetooth -o "$@"
 
 runtime: $(OUT)/ssbu-native
 
@@ -148,6 +148,7 @@ app: runtime shader-tools $(OUT)/launcher $(OUT)/AppIcon.icns
 	  '<key>LSMinimumSystemVersion</key><string>26.0</string>' \
 	  '<key>LSApplicationCategoryType</key><string>public.app-category.action-games</string>' \
 	  '<key>NSHighResolutionCapable</key><true/>' \
+	  '<key>NSBluetoothAlwaysUsageDescription</key><string>Pairs new controllers from the game'"'"'s controller screen.</string>' \
 	  '<key>SSBUWorkFolder</key><string>$(abspath $(WORK))</string>' \
 	  '</dict></plist>' > "$(APP)/Contents/Info.plist"
 	codesign --force --sign - "$(APP)"
