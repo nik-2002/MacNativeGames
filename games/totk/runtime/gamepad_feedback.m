@@ -208,12 +208,13 @@ static void hid_motion_start(void);
 static void hid_motion_stop(void);
 static uint64_t zeroSince;          /* the controller's handler queue */
 static BOOL motionSeen, hidAsked;   /* the controller's handler queue; reset on attach */
+static volatile int hidFailed;      /* main queue writes, the handler queue reads: no Switch Pro HID to fall back on */
 static void motion_sample(GCMotion *m) {   /* the controller's handler queue */
     GCAcceleration a = m.acceleration;
     if (m.hasGravityAndUserAcceleration) { a.x = m.gravity.x + m.userAcceleration.x; a.y = m.gravity.y + m.userAcceleration.y; a.z = m.gravity.z + m.userAcceleration.z; }
     const double acc[3] = {a.x, a.y, a.z}, gyro[3] = {m.rotationRate.x, m.rotationRate.y, m.rotationRate.z};
-    if (!motionSeen) {   /* a real sensor never reads exactly zero on all six axes; see hid_motion_start */
-        if (!acc[0] && !acc[1] && !acc[2] && !gyro[0] && !gyro[1] && !gyro[2]) {
+    if (!motionSeen && !hidFailed) {   /* a real sensor always reads gravity, so one axis is about 1 G; see hid_motion_start */
+        if (fabs(acc[0]) < 0.05 && fabs(acc[1]) < 0.05 && fabs(acc[2]) < 0.05) {   /* no gravity: GameController's motion is unusable, whatever the gyro says */
             uint64_t now = runtime_now_ns();
             if (!zeroSince) zeroSince = now;
             else if (!hidAsked && now - zeroSince > 1000000000ull) { hidAsked = YES; dispatch_async(dispatch_get_main_queue(), ^{ hid_motion_start(); }); }
@@ -302,8 +303,8 @@ static void hid_motion_start(void) {   /* main queue */
     IOHIDDeviceRef d = (__bridge IOHIDDeviceRef)devices.anyObject;
     IOReturn r = d ? IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) : kIOReturnNotFound;
     if (r != kIOReturnSuccess) {
-        fprintf(stderr, "[gyro] %s: GameController's motion is all zeros and no Switch Pro HID device could be opened (0x%x): no motion from it\n", name, r);
-        CFRelease(hidManager); hidManager = NULL; return;
+        fprintf(stderr, "[gyro] %s: GameController's motion carries no gravity and no Switch Pro HID device could be opened (0x%x): using its gyro as it is and no acceleration\n", name, r);
+        CFRelease(hidManager); hidManager = NULL; hidFailed = 1; return;
     }
     hidDevice = (IOHIDDeviceRef)CFRetain(d); hidLast = 0; hidUserCalibration = NO;
     motionPad.motion.valueChangedHandler = nil;   /* sensors stay active: GameController keeps the IMU reporting */
@@ -518,7 +519,7 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
         GCMotion *m = c.motion;
         if (!m || !m.hasRotationRate) { fprintf(stderr, "[gyro] %s has no gyro: no motion from it\n", name); return; }
         if (m.sensorsRequireManualActivation) m.sensorsActive = YES;
-        hid_motion_stop(); zeroSince = 0; motionSeen = hidAsked = NO; runtime_motion_deadzone_default(0);
+        hid_motion_stop(); zeroSince = 0; motionSeen = hidAsked = NO; hidFailed = 0; runtime_motion_deadzone_default(0);
         m.valueChangedHandler = ^(GCMotion *changed) { motion_sample(changed); };
         motionPad = c; runtime_motion_live(1);
         fprintf(stderr, "[gyro] %s: motion sensors on (gyro%s)\n", name, m.hasGravityAndUserAcceleration ? ", gravity" : ", acceleration");

@@ -22,7 +22,7 @@ static void botw_aspect_apply(void);
    patches on the Mac, and the patched text and patch area are embedded in the app (ios/tools/gen_embed.py), as for
    Tears of the Kingdom (game_patches.c). On the device the original words are not checked (they are patched already) and
    each patched word is checked instead of written. The switches that leave a patch out (TOTK_REALTIME=0,
-   TOTK_PAD_REPEAT=0, TOTK_SLINK_REALTIME=0, TOTK_RENDER_RES=900, TOTK_EXCL_ACQUIRE=0), the brk diagnostics (TOTK_PAD_LOG, TOTK_JQ_CHECK) and the
+   TOTK_PAD_REPEAT=0, TOTK_SLINK_REALTIME=0, TOTK_RENDER_RES=900 / 720, TOTK_EXCL_ACQUIRE=0), the brk diagnostics (TOTK_PAD_LOG, TOTK_JQ_CHECK) and the
    native output size (TOTK_OUTPUT_RES) are Mac only; the export ignores them too, so the device checks what it made. */
 #if TARGET_OS_IPHONE
 #define CODE_PATCHED_AT_BUILD 1
@@ -526,12 +526,17 @@ static unsigned excl_acquire(uint8_t *code, size_t n, int write) {   /* write 0:
    main+0x1821674 movk x8, #0x44c8, lsl #48 (1600.0) -> movk x8, #0x44f0, lsl #48 (1920.0).
    1.9.0's display-mode routine is main+0x1266074 (a jump on the mode byte +0x11be; docked and mode 2 store the same pair
    to +0x1210 / +0x1214 and crop 1920x1080; handheld stores 1280.0 / 1280.0 and is left as shipped):
-   main+0x12660c8 movk x8, #0x44c8, lsl #48 -> movk x8, #0x44f0, lsl #48. */
+   main+0x12660c8 movk x8, #0x44c8, lsl #48 -> movk x8, #0x44f0, lsl #48.
+   TOTK_RENDER_RES=720 draws the scene at 1280x720 under the same 1080p canvas (render width 1280.0, as the phone's
+   960.0 under its 1280.0 screen): a third of the scene's pixels, the UI still at 1080p, and the game's upscale into the
+   canvas is what MetalFX replaces (TOTK_MFX_UPSCALE=1 or the settings panel's MetalFX; nvn_mtl.m mfxup_dock reads the
+   region from the upscale's constants, so it takes any scene size below the canvas). movk x8, #0x44a0, lsl #48. */
 #ifdef GAME_BOTW160
 enum { RENDER_MOVK = 0x1821674 };
 #else
 enum { RENDER_MOVK = 0x12660c8 };
 #endif
+static int render_720(void) { const char *e = getenv("TOTK_RENDER_RES"); return !ios_code() && e && !strcmp(e, "720"); }
 static void patch_render_1080(Module *m) {
     const char *e = getenv("TOTK_RENDER_RES");
     if (!ios_code() && e && !strcmp(e, "900")) { fprintf(stderr, "[botw] docked render size 1600x900, as shipped (TOTK_RENDER_RES=900)\n"); return; }
@@ -550,9 +555,10 @@ static void patch_render_1080(Module *m) {
             runtime_fail("1080p render size requires the " TOTK_GAME_VERSION " display-mode instructions");
         }
     }
-    const uint32_t movk = 0xf2e89e08u;   /* movk x8, #0x44f0, lsl #48 */
+    const uint32_t movk = render_720() ? 0xf2e89408u : 0xf2e89e08u;   /* movk x8, #0x44a0 / #0x44f0, lsl #48 */
     put_word(m, RENDER_MOVK, movk, "docked render size");
-    fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
+    fprintf(stderr, render_720() ? "[botw] docked render size 1280x720 under the 1080p canvas (TOTK_RENDER_RES=720)\n"
+                                 : "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
 }
 /* The phone's render size (user 2026-10-23: "内部960×540，输出 用默认 放大机制"): the iPhone / iPad runs the handheld
    mode, whose branch of the 1.6.0 display-mode routine (jump table at main+0x26164f8: mode 1 -> main+0x18216c8) stores
@@ -760,9 +766,14 @@ static uint64_t output_floats(unsigned screen, unsigned render) {
     float a = (float)screen, b = (float)render; uint32_t x, y; memcpy(&x, &a, 4); memcpy(&y, &b, 4);
     return x | ((uint64_t)y << 32);
 }
+static _Atomic int g_scene_720 = -1;   /* the 1080p canvas draws its scene at 1280x720: TOTK_RENDER_RES=720 at the start, then the picture mode */
+static int scene_720(void) { int v = atomic_load(&g_scene_720); if (v < 0) { v = render_720(); atomic_store(&g_scene_720, v); } return v; }
 static void output_page(unsigned w, unsigned h) {   /* what the docked branch writes from its next run on */
     const char *e = getenv("TOTK_RENDER_RES");
-    unsigned render = w == 1920 && h == 1080 && e && !strcmp(e, "900") ? 1600 : w;   /* the shipped 1600x900 scene at 1080p only */
+    unsigned render = w;   /* the shipped 1600x900 or a 1280x720 scene, at the 1080p canvas only */
+    if (w == 1920 && h == 1080 && e && !strcmp(e, "900")) render = 1600;
+    if (w == 1920 && h == 1080 && scene_720()) render = 1280;
+    { static unsigned told; if (render != w && told != render) { told = render; fprintf(stderr, "[botw] scene %ux%u under the %ux%u canvas (TOTK_RENDER_RES=%s)\n", render, render * h / w, w, h, e); } }
     atomic_store(&g_out_page[0], output_floats(w, render));
     atomic_store(&g_out_page[1], w | ((uint64_t)h << 32));
     atomic_store(&g_out_cur, w | ((uint64_t)h << 32));
@@ -890,7 +901,7 @@ int runtime_output_native(int mode, unsigned *w, unsigned *h) {
 }
 int runtime_output_modes(void) {
     unsigned w, h;
-    return 1 << OUTPUT_MODE_OFF | 1 << OUTPUT_MODE_METALFX | (output_switchable() ? 1 << OUTPUT_MODE_720P : 0) |
+    return 1 << OUTPUT_MODE_OFF | 1 << OUTPUT_MODE_METALFX | (output_switchable() ? 1 << OUTPUT_MODE_720P | 1 << OUTPUT_MODE_720P_METALFX : 0) |
            (runtime_output_native(OUTPUT_MODE_NATIVE, &w, &h) ? 1 << OUTPUT_MODE_NATIVE | 1 << OUTPUT_MODE_NATIVE_METALFX : 0);
 }
 int runtime_output_mode(void) {
@@ -899,24 +910,30 @@ int runtime_output_mode(void) {
         unsigned w = output_width_now();
         if (w == 1280) return OUTPUT_MODE_720P;
         if (w > 1920) return mfxup_enabled() ? OUTPUT_MODE_NATIVE_METALFX : OUTPUT_MODE_NATIVE;
+#ifdef GAME_BOTW160
+        if (scene_720() && mfxup_enabled()) return OUTPUT_MODE_720P_METALFX;
+#endif
     }
     return mfxup_enabled() ? OUTPUT_MODE_METALFX : OUTPUT_MODE_OFF;
 }
 int runtime_output_mode_set(int mode) {
     extern void dm_gfx_set_flag(const char *name, int value);
-    if (mode < OUTPUT_MODE_OFF || mode > OUTPUT_MODE_720P || !(runtime_output_modes() & 1 << mode)) return 0;
-    int mfx = mode == OUTPUT_MODE_METALFX || mode == OUTPUT_MODE_NATIVE_METALFX;   /* 2K + MetalFX: the output stage scales the 2K canvas to the window */
+    if (mode < OUTPUT_MODE_OFF || mode > OUTPUT_MODE_720P_METALFX || !(runtime_output_modes() & 1 << mode)) return 0;
+    /* 2K + MetalFX: the output stage scales the 2K canvas to the window; 720p + MetalFX: MetalFX upscales the 720p scene into the 1080p canvas */
+    int mfx = mode == OUTPUT_MODE_METALFX || mode == OUTPUT_MODE_NATIVE_METALFX || mode == OUTPUT_MODE_720P_METALFX;
     dm_gfx_set_flag("mfx_output", mfx);
     dm_gfx_set_flag("mfx_upscale", mfx);
 #ifdef GAME_BOTW160
     if (output_switchable()) {
         unsigned w = 1920, h = 1080;
         if (mode == OUTPUT_MODE_720P) { w = 1280; h = 720; } else if (mode == OUTPUT_MODE_NATIVE || mode == OUTPUT_MODE_NATIVE_METALFX) { w = g_out_w; h = g_out_h; }
-        if (output_width_now() != w) output_switch(w, h);
+        int scene = mode == OUTPUT_MODE_720P_METALFX, was = scene_720();
+        atomic_store(&g_scene_720, scene);
+        if (output_width_now() != w || (w == 1920 && scene != was)) output_switch(w, h);   /* same canvas, other scene size: the display mode applies it again */
     }
 #endif
     fprintf(stderr, "[botw] picture: %s\n", mode == OUTPUT_MODE_NATIVE ? "native 2K" : mode == OUTPUT_MODE_NATIVE_METALFX ? "native 2K, MetalFX to the window" : mode == OUTPUT_MODE_720P ? "720p" :
-            mode == OUTPUT_MODE_METALFX ? "MetalFX 2K" : "off (1080p)");
+            mode == OUTPUT_MODE_720P_METALFX ? "720p scene, MetalFX to the 1080p canvas" : mode == OUTPUT_MODE_METALFX ? "MetalFX 2K" : "off (1080p)");
     return 1;
 }
 /* Key 4 (runtime/input.c): ultrawide on / off (TOTK_ASPECT, default 21:9; also 32:9, 3440x1440 or 2.39; TOTK_ASPECT set
