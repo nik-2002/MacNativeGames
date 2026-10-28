@@ -226,6 +226,10 @@ int main(int argc, char **argv) {
         setenv("TOTK_CONTROLS", controls.fileSystemRepresentation, 1);
         /* key 3's picture mode, kept between runs (runtime/game_patches_v143.c picture_mode_save / _restore) */
         setenv("TOTK_PICTURE_MODE", env_or("TOTK_PICTURE_MODE", [data stringByAppendingPathComponent:@"picture-mode.txt"]).fileSystemRepresentation, 1);
+        /* macOS 27: the uncapped present path (its own 240 Hz clock) corrupts memory and the game crashes minutes in at a
+           random main offset, the fault address float bits (upstream #1192; here 1.4.3, main+0x1211728, 2026-10-28). Wait for
+           the display refresh instead; an explicit TOTK_UNCAPPED=1 in the environment turns it back on. */
+        setenv("TOTK_UNCAPPED", "0", 0);
         setenv("TOTK_PROFILE_DIR", profile.fileSystemRepresentation, 1);
         setenv("TOTK_SHADER_CACHE", cache.fileSystemRepresentation, 1);
         setenv("TOTK_GAME_SLOT_DIR", slot.fileSystemRepresentation, 1);
