@@ -438,6 +438,9 @@ void runtime_game_patches(Module *m) {
 static int output_full_at_start;
 static unsigned output_w,output_h;
 static _Atomic(uint8_t *) output_page;
+/* OUTPUT_MODE_720P_RENDER / _720P_METALFX: the scene at 1280x720 under the 1080p canvas (render_scene_720); _at_start: the
+   picture mode kept from the last run asks for it before the render-resolution patch is installed. */
+static int scene_720,scene_720_at_start;
 static uint64_t pack_size(unsigned w,unsigned h){return (uint64_t)h<<32|w;}
 uint64_t runtime_output_size_current(void){
     uint8_t *page=atomic_load(&output_page);
@@ -508,7 +511,8 @@ uint64_t runtime_output_res_extra_bytes(void){
 static void picture_mode_save(uint64_t size){
     const char *path=getenv("TOTK_PICTURE_MODE");if(!path||!*path)return;
     extern int mfxup_output_enabled(void);
-    const char *mode=mfxup_output_enabled()?(size==pack_size(2560,1440)?"native-2k-metalfx":"metalfx"):size==pack_size(2560,1440)?"native-2k":
+    const char *mode=scene_720?(mfxup_output_enabled()?"720p-render-metalfx":"720p-render"):
+                     mfxup_output_enabled()?(size==pack_size(2560,1440)?"native-2k-metalfx":"metalfx"):size==pack_size(2560,1440)?"native-2k":
                      size==pack_size(3840,2160)?"native-4k":size==pack_size(1280,720)?"720p":"off";
     FILE *f=fopen(path,"w");
     if(!f||fprintf(f,"%s\n",mode)<0||fclose(f)){fprintf(stderr,"[totk] picture mode: cannot write %s\n",path);return;}
@@ -526,7 +530,10 @@ static void picture_mode_restore(uint8_t *page){
         w=2560;h=1440;dm_gfx_set_flag("mfx_output",1);dm_gfx_set_flag("mfx_upscale",1);}
     else if(!strcmp(mode,"metalfx")){extern void dm_gfx_set_flag(const char *,int);dm_gfx_set_flag("mfx_output",1);dm_gfx_set_flag("mfx_upscale",1);}
     else if(!strcmp(mode,"720p")){w=1280;h=720;}
-    else if(strcmp(mode,"off")){fprintf(stderr,"[totk] picture mode: %s holds \"%s\", not off, metalfx, native-2k, native-2k-metalfx, native-4k or 720p; starting off\n",path,mode);return;}
+    else if(!strcmp(mode,"720p-render"))scene_720_at_start=1;
+    else if(!strcmp(mode,"720p-render-metalfx")){extern void dm_gfx_set_flag(const char *,int);
+        scene_720_at_start=1;dm_gfx_set_flag("mfx_output",1);dm_gfx_set_flag("mfx_upscale",1);}
+    else if(strcmp(mode,"off")){fprintf(stderr,"[totk] picture mode: %s holds \"%s\", not off, metalfx, native-2k, native-2k-metalfx, native-4k, 720p, 720p-render or 720p-render-metalfx; starting off\n",path,mode);return;}
     atomic_store((_Atomic uint64_t *)(void *)(page+32),pack_size(w,h));
     fprintf(stderr,"[totk] picture mode: starts in %s (kept from the last run, %s)\n",mode,path);
 }
@@ -603,6 +610,20 @@ static void render_res_publish(unsigned canvas_w){
     memcpy(render_page+16,v,sizeof v);
     fprintf(stderr,"[totk] 1.4.3 render resolution: %ux%u on a %u-wide canvas (game size %.0fx%.0f, scaled by %.4f)\n",render_w,render_h,canvas_w,v[0],v[1],k);
 }
+/* The settings panel's 720p render modes: the scene at 1280x720 whatever the canvas (the 1080p one for these modes), the
+   UI at the canvas's size; off: back to the size the start chose (the canvas's own, or TOTK_RENDER_RES). The game takes a
+   new size when its display mode is rebuilt, which the caller asks for (runtime_output_mode_set). Returns 1 when the
+   scene size changed. */
+static int render_scene_720(int on){
+    static unsigned keep_w,keep_h;static int keep_canvas;
+    if(!render_page||!on==!scene_720)return 0;
+    if(on){keep_w=render_w;keep_h=render_h;keep_canvas=render_canvas;render_canvas=0;render_w=1280;render_h=720;}
+    else{render_canvas=keep_canvas;render_w=keep_w;render_h=keep_h;}
+    scene_720=on;
+    render_res_publish((unsigned)runtime_output_size_current());
+    fprintf(stderr,"[totk] 1.4.3 render resolution: %s\n",on?"720p scene under the 1080p canvas":"the scene follows the start size again");
+    return 1;
+}
 /* On by default on both (user 2026-10-23: "两边默认都打开"; before, only with TOTK_RENDER_RES, as PR #19 brought it):
    - Mac: the scene is the canvas's size, 1920x1080 on the 1080p canvas (the docked mode's own is 1600x900) and 2560x1440
      on the 2K one (the settings panel), only ever up (the Mac never lowers resolution). The heaps grow with it (romfs.c picks the
@@ -661,6 +682,7 @@ static void patch_render_res(Module *m){
 #endif
     render_page=m->base+data;render_w=w;render_h=h;
     render_res_publish(output_w?(unsigned)runtime_output_size_current():1920);
+    if(scene_720_at_start&&output_w)render_scene_720(1);   /* the game reads the size at its start: nothing to rebuild yet */
     fprintf(stderr,"[totk] 1.4.3 render resolution patch: scene render size %ux%u%s (4 instructions at main+0x585e48, value on the data page)\n",
             w,h,set?"":" (the game's handheld size; TOTK_RENDER_RES not set)");
 }
@@ -687,14 +709,22 @@ static void patch_fixed_res(Module *m){
     fprintf(stderr,"[totk] 1.4.3 fixed resolution (TOTK_FIXED_RES): the dynamic resolution controller's scale is held at 100 %% (1 instruction at main+%#llx)\n",(unsigned long long)site);
 #endif
 }
+static void output_rebuild(void);
 /* The game's canvas: any size up to the swapchain's. The scene size goes first (the game rebuilds when told). */
 static void output_size_set(uint64_t want){
     _Atomic uint64_t *size=(_Atomic uint64_t *)(void *)(output_page+32);
     if(atomic_load(size)==want)return;
     atomic_store(size,want);render_res_publish((unsigned)want);
-    uint64_t config=atomic_load((_Atomic uint64_t *)(void *)(output_page+40));
+    output_rebuild();
+    fprintf(stderr,"[totk] 1.4.3 output requested %ux%u\n",(unsigned)want,(unsigned)(want>>32));
+}
+/* Tell the game its display mode changed (pending bit 21 of the display config, message 30): it rebuilds the canvas
+   and reads the scene size again. Before the game published its display config there is nothing to rebuild. */
+static void output_rebuild(void){
+    uint8_t *page=atomic_load(&output_page);if(!page)return;
+    uint64_t config=atomic_load((_Atomic uint64_t *)(void *)(page+40));
     if(config){__atomic_fetch_or((uint32_t *)(uintptr_t)(config+8),1u<<21,__ATOMIC_SEQ_CST);runtime_oe_push_message(30);}
-    fprintf(stderr,"[totk] 1.4.3 output requested %ux%u (display config %s)\n",(unsigned)want,(unsigned)(want>>32),config?"ready":"not published yet");
+    fprintf(stderr,"[totk] 1.4.3 display rebuild %s\n",config?"requested":"not needed (display config not published yet)");
 }
 /* The settings panel's resolution (runtime.h OUTPUT_MODE_*), kept for the next start (picture_mode_save). Native is
    the swapchain's size (2K); with MetalFX the output stage then scales the 2K canvas up to the window (a 4K screen). */
@@ -704,25 +734,32 @@ int runtime_output_native(int mode,unsigned *w,unsigned *h){
 }
 int runtime_output_modes(void){
     if(!output_page)return 0;
-    return 1<<OUTPUT_MODE_OFF|1<<OUTPUT_MODE_METALFX|1<<OUTPUT_MODE_720P|1<<OUTPUT_MODE_NATIVE|1<<OUTPUT_MODE_NATIVE_METALFX;
+    return 1<<OUTPUT_MODE_OFF|1<<OUTPUT_MODE_METALFX|1<<OUTPUT_MODE_720P|1<<OUTPUT_MODE_NATIVE|1<<OUTPUT_MODE_NATIVE_METALFX|
+           (render_page?1<<OUTPUT_MODE_720P_RENDER|1<<OUTPUT_MODE_720P_METALFX:0);
 }
 int runtime_output_mode(void){
     extern int mfxup_output_enabled(void);
     if(!output_page)return OUTPUT_MODE_OFF;
     uint64_t now=atomic_load((_Atomic uint64_t *)(void *)(output_page+32));
     if(now==pack_size(1280,720))return OUTPUT_MODE_720P;
+    if(scene_720)return mfxup_output_enabled()?OUTPUT_MODE_720P_METALFX:OUTPUT_MODE_720P_RENDER;
     if((unsigned)now>1920)return mfxup_output_enabled()?OUTPUT_MODE_NATIVE_METALFX:OUTPUT_MODE_NATIVE;
     return mfxup_output_enabled()?OUTPUT_MODE_METALFX:OUTPUT_MODE_OFF;
 }
 int runtime_output_mode_set(int mode){
     extern void dm_gfx_set_flag(const char *,int);
-    if(!output_page||mode<OUTPUT_MODE_OFF||mode>OUTPUT_MODE_720P||!(runtime_output_modes()&1<<mode))return 0;
+    if(!output_page||mode<OUTPUT_MODE_OFF||mode>OUTPUT_MODE_720P_RENDER||!(runtime_output_modes()&1<<mode))return 0;
     unsigned w=1920,h=1080;
     if(mode==OUTPUT_MODE_720P){w=1280;h=720;}else if(mode==OUTPUT_MODE_NATIVE||mode==OUTPUT_MODE_NATIVE_METALFX)runtime_output_native(mode,&w,&h);
-    output_size_set(pack_size(w,h));
-    int mfx=mode==OUTPUT_MODE_METALFX||mode==OUTPUT_MODE_NATIVE_METALFX;
+    int mfx=mode==OUTPUT_MODE_METALFX||mode==OUTPUT_MODE_NATIVE_METALFX||mode==OUTPUT_MODE_720P_METALFX;
     dm_gfx_set_flag("mfx_output",mfx);dm_gfx_set_flag("mfx_upscale",mfx);
-    fprintf(stderr,"[totk] picture: %s\n",mode==OUTPUT_MODE_720P?"720p":mode==OUTPUT_MODE_NATIVE_METALFX?"native 2K, MetalFX to the window":
+    /* the scene size first: a canvas change rebuilds with it, and on the same canvas the rebuild is asked for here */
+    int scene=mode==OUTPUT_MODE_720P_RENDER||mode==OUTPUT_MODE_720P_METALFX;
+    int changed=render_scene_720(scene);
+    if(runtime_output_size_current()!=pack_size(w,h))output_size_set(pack_size(w,h));   /* rebuilds with the new scene size */
+    else if(changed)output_rebuild();
+    fprintf(stderr,"[totk] picture: %s\n",mode==OUTPUT_MODE_720P_RENDER?"720p render, the game's upscale to 1080p":
+            mode==OUTPUT_MODE_720P_METALFX?"720p render, MetalFX to 1080p and the window":mode==OUTPUT_MODE_720P?"720p":mode==OUTPUT_MODE_NATIVE_METALFX?"native 2K, MetalFX to the window":
             mode==OUTPUT_MODE_NATIVE?"native":mode==OUTPUT_MODE_METALFX?"MetalFX 2K":"off (1080p)");
     picture_mode_save(atomic_load((_Atomic uint64_t *)(void *)(output_page+32)));
     return 1;

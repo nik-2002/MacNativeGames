@@ -98,8 +98,11 @@ int runtime_render_res(unsigned *w, unsigned *h);   /* TOTK_RENDER_RES above 160
    (user 2026-10-25: "4K" as 2K + MetalFX, a 4K swapchain's heaps being too big for one GPU buffer); also 720p, a
    1280x720 canvas whose scene follows it (user 2026-10-25, in place of the Switch's own handheld / docked sizes: the game
    reads its docked scene size only at the start, so a switch to it never took effect).
+   OUTPUT_MODE_720P_RENDER / _720P_METALFX (1.4.3): the 1080p canvas with the scene drawn at 1280x720, the UI at 1080p;
+   the game's own upscale draws the scene into the canvas, or MetalFX does (game_patches_v143.c render_scene_720).
    runtime_output_modes: a bit (1 << mode) for each this game and start offer; 0 when the resolution cannot change. */
-enum { OUTPUT_MODE_OFF, OUTPUT_MODE_METALFX, OUTPUT_MODE_NATIVE, OUTPUT_MODE_NATIVE_METALFX, OUTPUT_MODE_720P };
+enum { OUTPUT_MODE_OFF, OUTPUT_MODE_METALFX, OUTPUT_MODE_NATIVE, OUTPUT_MODE_NATIVE_METALFX, OUTPUT_MODE_720P, OUTPUT_MODE_720P_METALFX,
+       OUTPUT_MODE_720P_RENDER };
 int runtime_output_modes(void);
 int runtime_output_mode(void);
 int runtime_output_mode_set(int mode);                  /* returns 0 where that mode is not offered */
