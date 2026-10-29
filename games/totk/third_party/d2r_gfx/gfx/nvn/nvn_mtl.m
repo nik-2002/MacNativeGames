@@ -6070,7 +6070,10 @@ static void treg_clear_pkg_views_locked(int (*gone)(NvPkg *)) {   // texture-poo
 static int pkg_dropped(NvPkg *pk) { return !pk->tex; }
 static int pkg_purgeable(NvPkg *pk) { return pk->vol; }
 static void pkg_purge_idle(void) {
-    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_TEX_PURGE"); on = TARGET_OS_IPHONE && !(e && !atoi(e)); if (on) MLOG("贴图副本可清除：开（闲置 ≥%d 次提交的副本交给系统，缺内存时由系统回收；TOTK_TEX_PURGE=0 关）", PURGE_IDLE); }
+    /* Mac: on for 8 GB or less (user 2026-10-29: an M1 Air at 5.6-6.3 GB footprint with ~1 GB swapped), where the ~450 MB
+       of copies otherwise stay resident; TOTK_TEX_PURGE=1 / =0 decides on any Mac */
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_TEX_PURGE");
+        on = e && *e ? atoi(e) != 0 : TARGET_OS_IPHONE || NSProcessInfo.processInfo.physicalMemory <= (8ull << 30); if (on) MLOG("贴图副本可清除：开（闲置 ≥%d 次提交的副本交给系统，缺内存时由系统回收；TOTK_TEX_PURGE=0 关）", PURGE_IDLE); }
     if (!on || (g_sub_serial & 15)) return;
     uint64_t k = 0, bytes = 0;
     registry_lock();
