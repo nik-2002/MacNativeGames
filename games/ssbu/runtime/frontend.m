@@ -69,6 +69,17 @@ void runtime_boot_status(const char *stage,const char *detail){
   bootProgress.indeterminate=YES;[bootProgress startAnimation:nil];
  });
 }
+void runtime_warm_begin(void){
+ /* Before the warm-up plans: listing the translation cache (100,000+ files) takes over 3 s, past the first frame's
+    timeout above, which hid the loading screen and left a black window for the whole warm-up. */
+ atomic_store(&warmPending,1);atomic_store(&warmStarted,1);
+ dispatch_async(dispatch_get_main_queue(), ^{
+  if(!bootOverlay||bootOverlay.hidden)return;
+  bootStage.stringValue=@(TOTK_UI("正在准备图形","Preparing graphics"));
+  bootDetail.stringValue=@(TOTK_UI("正在读取着色器清单","Reading the shader lists"));
+  bootProgress.indeterminate=YES;[bootProgress startAnimation:nil];
+ });
+}
 void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_t shader_total,uint64_t pipelines,uint64_t pipeline_total){
  atomic_store(&warmPending,1);atomic_store(&warmStarted,1);(void)shader_total;
  dispatch_async(dispatch_get_main_queue(), ^{

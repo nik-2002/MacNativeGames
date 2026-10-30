@@ -74,6 +74,7 @@ extern __thread sigjmp_buf *runtime_fault_guard;   // runtime/loader.c: a guarde
 static void warm_start(void);
 static void warm_claim(void);
 int mtl_warm_wait(int timeout_ms);
+extern void runtime_warm_begin(void) __attribute__((weak_import));   // before planning: the loading screen stays
 extern void runtime_warm_progress(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) __attribute__((weak_import));
 extern void runtime_warm_done(void) __attribute__((weak_import));
 extern void runtime_warm_ready(void) __attribute__((weak_import));   // the game may start: the loading screen goes
@@ -6954,6 +6955,7 @@ static void warm_start(void) {
     warm_filled();
     const char *e = getenv("DM_PSO_MANIFEST");
     if (e && !strcmp(e, "off")) { warm_light(); return; }
+    if (runtime_warm_begin) runtime_warm_begin();   // every path from here ends in runtime_warm_ready
     NSArray<NSString *> *paths;
     if (e && *e) {
         paths = @[@(e)];
