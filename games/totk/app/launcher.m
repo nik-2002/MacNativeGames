@@ -1,6 +1,7 @@
 // The launcher inside the packaged app (build_app.py compiles it as Contents/MacOS/TOTK).
 // The game itself is Contents/Resources/totk/build/totk-native; everything it writes goes to the player's own folders:
-//   ~/Library/Application Support/MacNativeGames/TOTK/   profile (account, saves), shader cache, game slot, RomFS proof (BotW/ for Breath of the Wild)
+//   ~/Library/Application Support/MacNativeGames/TOTK/   profile (account, saves; players/<id> for each further player,
+//                                                        players.h), shader cache, game slot, RomFS proof (BotW/ for Breath of the Wild)
 //   ~/Library/Logs/MacNativeGames/totk.log             this run, only with the debug log on (totk.previous.log: the one before; botw.log for Breath of the Wild)
 // If the game is already running, the launcher only brings it to the front.
 #import <AppKit/AppKit.h>
@@ -23,6 +24,7 @@
 #include "totk_shader_contrib.h"   // the shared shader list contribution and its reminder
 #include "contrib_submit.h"        // its "Submit automatically" (gh), shared with the settings panel
 #include "update_notice.h"
+#include "players.h"              // who is playing: a profile folder per player
 
 static void show_error(NSString *detail) {
     NSAlert *alert = [NSAlert new];
@@ -233,10 +235,9 @@ int main(int argc, char **argv) {
            TOTK_GAME_SLOT_DIR shares one game slot with another build of the game: one game at a time on the Mac). */
         NSString *(^env_or)(const char *, NSString *) = ^NSString *(const char *name, NSString *fallback) {
             const char *v = getenv(name); return v && *v ? @(v) : fallback; };
-        NSString *profile = env_or("TOTK_PROFILE_DIR", [data stringByAppendingPathComponent:@"profile"]);
         NSString *slot = env_or("TOTK_GAME_SLOT_DIR", [data stringByAppendingPathComponent:@"game-slot"]);
         NSString *cache = env_or("TOTK_SHADER_CACHE", [data stringByAppendingPathComponent:[NSString stringWithFormat:@"shader-cache/rt-%s", DMSH_CHAIN]]);
-        if (!make_dir(profile) || !make_dir(slot) || !make_dir(cache) || !make_dir(logs)) {
+        if (!make_dir(slot) || !make_dir(cache) || !make_dir(logs)) {
             show_error([NSString stringWithFormat:@"Cannot create %@.", data]);
             return 1;
         }
@@ -245,6 +246,16 @@ int main(int argc, char **argv) {
             [[NSRunningApplication runningApplicationWithProcessIdentifier:running] activateWithOptions:NSApplicationActivateAllWindows];
             return 0;
         }
+        /* The player (players.h): a TOTK_PROFILE_DIR from the environment (a test on a save copy) is used as it is. */
+        NSString *profile = env_or("TOTK_PROFILE_DIR", nil), *player = nil;
+        BOOL severalPlayers = NO;
+        if (!profile && !players_choose(data, &profile, &player, &severalPlayers)) return 0;
+        if (!make_dir(profile)) {
+            show_error([NSString stringWithFormat:@"Cannot create %@.", profile]);
+            return 1;
+        }
+        if (severalPlayers) setenv("TOTK_PLAYER_NAME", player.UTF8String, 1);   // the window title names the player
+        else unsetenv("TOTK_PLAYER_NAME");
         mng_update_notice(data);
 #if defined(TOTK_GAME_V112) || defined(TOTK_GAME_V121) || defined(TOTK_GAME_V143)
         NSString *backup = [profile stringByAppendingFormat:@"-before-%s", TOTK_GAME_VERSION];
