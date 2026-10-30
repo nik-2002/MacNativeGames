@@ -584,7 +584,7 @@ static void patch_output_res(Module *m){
 /* Render resolution (TOTK_RENDER_RES=<w>x<h>, e.g. 960x540) - the 1.4.3 port of game_patches.c's patch.
    1.4.3 keeps the same graphics-parameter entry (+0x30 of the mode entry: handheld 1280x720, docked 1600x900) and the
    same renderer fields (+0xcc4 width, +0xcc8 height), but converts both through s0 and keeps the output size in w9:
-     main+0x585e48  scvtf s0, w11             -> adrp x3, <data page>
+     main+0x585e48  scvtf s0, w11             -> adrp x3, <data page>   (Mac: b to render_reread's stub, which does it)
      main+0x585e50  str   s0, [x19, #0xcc4]   -> ldp  s0, s1, [x3, #16]
      main+0x585e54  scvtf s0, w10             -> str  s0, [x19, #0xcc4]
      main+0x585e60  str   s0, [x19, #0xcc8]   -> str  s1, [x19, #0xcc8]
@@ -600,15 +600,36 @@ static void patch_output_res(Module *m){
    output width over 1920, on both axes (measured: 2560x1440 asked on a 2560x1440 canvas rendered 3408x1920, 3440x1440 on
    the 3440x1440 canvas 6160x2576). The data page therefore holds the asked size divided by that factor, rewritten when
    the settings panel changes the canvas, so the scene is the size asked for on every canvas. Below 1920 the same factor
-   holds (2026-10-25: 1920x1080 on the 720p canvas rendered 1280x720). The game reads this size only at the start: after
-   that it scales the size it read there with the canvas (a 1600x900 written on the 1080p canvas was never taken). */
+   holds (2026-10-25: 1920x1080 on the 720p canvas rendered 1280x720). The game reads this size only when its renderer
+   sets a display mode (a 1600x900 written on the 1080p canvas was never taken by the canvas rebuild alone): see
+   render_reread. */
+/* Reading the size again mid-game (user 2026-10-29: the settings panel's 720p render, chosen during play, kept the 1080p
+   scene). The size function is main+0x585da0(renderer, mode). The renderer's per-frame update (main+0x581f58) works out
+   the mode it wants (1 docked) and compares it with the one it last set (int8 at renderer+0xcd0); when they differ it
+   stores the new one and calls the size function (main+0x5822d0), which reads the size, stores it at +0xcc4/+0xcc8 and
+   marks the targets for rebuilding (+0xca0 |= 9), as on docking. Writing -1 there (no mode) makes the next frame run it,
+   as Breath of the Wild's request byte does (game_patches_botw.c output_reapply). The renderer comes from the size
+   function itself: on the Mac its first patched word branches to a stub that keeps x19 on the data page (+48):
+     stub+0  adrp x3, <data page>   stub+4  str x19, [x3, #48]   stub+8  b main+0x585e4c
+   in the text padding's free 32 bytes at +288 (after the bounce veneer, before the Vert+ stubs). The iOS export keeps
+   the plain adrp: the phone has no settings panel switch. */
+enum { RENDER_STUB=288, RENDER_PTR=48, RENDER_MODE=0xcd0 };
 static uint8_t *render_page;static unsigned render_w,render_h;static int render_canvas;
+static void render_reread(void){
+    if(!render_page)return;
+    uint64_t r=atomic_load((_Atomic uint64_t *)(void *)(render_page+RENDER_PTR));
+    if(!r)return;   /* the renderer has not set a mode yet: it reads the size when it does */
+    __atomic_store_n((int8_t *)(uintptr_t)(r+RENDER_MODE),(int8_t)-1,__ATOMIC_SEQ_CST);
+    fprintf(stderr,"[totk] 1.4.3 render resolution: the renderer reads the size again at the next frame\n");
+}
 static void render_res_publish(unsigned canvas_w){
     if(!render_page)return;
-    float k=canvas_w/1920.0f,v[2]={render_w/k,render_h/k};
+    float k=canvas_w/1920.0f,v[2]={render_w/k,render_h/k},was[2];
     if(render_canvas){v[0]=1920;v[1]=1080;render_w=(unsigned)(1920*k);render_h=(unsigned)(1080*k);}   /* the game's scaling makes it the canvas */
+    memcpy(was,render_page+16,sizeof was);
     memcpy(render_page+16,v,sizeof v);
     fprintf(stderr,"[totk] 1.4.3 render resolution: %ux%u on a %u-wide canvas (game size %.0fx%.0f, scaled by %.4f)\n",render_w,render_h,canvas_w,v[0],v[1],k);
+    if(memcmp(was,v,sizeof v))render_reread();
 }
 /* The settings panel's 720p render modes: the scene at 1280x720 whatever the canvas (the 1080p one for these modes), the
    UI at the canvas's size; off: back to the size the start chose (the canvas's own, or TOTK_RENDER_RES). The game takes a
@@ -653,7 +674,7 @@ static void patch_render_res(Module *m){
     if(!set)return;   /* Mac (and the iOS export): the game's own size unless asked */
 #endif
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL;
-    if(data+24>m->size)runtime_fail("1.4.3 render-resolution patch layout");
+    if(data+RENDER_PTR+8>m->size)runtime_fail("1.4.3 render-resolution patch layout");
     const Patch sites[]={
         {0x585e48,0x1e220160,0},
         {0x585e50,0xbd0cc660,0x2d420460},
@@ -677,6 +698,16 @@ static void patch_render_res(Module *m){
                     (unsigned long long)sites[i].off,word,sites[i].original);
             runtime_fail("render resolution patch: main does not match 1.4.3");
         }
+    }
+    if(!getenv("TOTK_EXPORT_IOS")){   /* render_reread's stub: keeps the renderer, then the adrp as before */
+        uint64_t stub=((m->text_end+15)&~15ULL)+RENDER_STUB;
+        if(stub+12>((m->text_end+0xfff)&~0xfffULL))runtime_fail("1.4.3 render-resolution stub layout");
+        for(unsigned i=0;i<12;i++)if(m->base[stub+i])runtime_fail("1.4.3 render-resolution stub padding not empty");
+        uint32_t code[3]={adrp(3,(uintptr_t)m->base+stub,(uintptr_t)m->base+data),
+            0xf9001873,   /* str x19, [x3, #48]: the renderer (RENDER_PTR) */
+            branch(stub+8,sites[0].off+4)};
+        memcpy(m->base+stub,code,sizeof code);
+        want[0]=branch(sites[0].off,stub);
     }
     for(unsigned i=0;i<sizeof sites/sizeof *sites;i++)memcpy(m->base+sites[i].off,&want[i],4);
 #endif
