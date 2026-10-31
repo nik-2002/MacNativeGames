@@ -311,7 +311,15 @@ int main(int argc, const char **argv) { @autoreleasepool {
     mfxup_output_set(0); mfxup_set(0); shows(@"Resolution", @"1080p");
     BOOL nativeResolution = !!(runtime_output_modes() & (1 << OUTPUT_MODE_NATIVE));
     if (nativeResolution) {
+#ifdef GAME_BOTW160
+    /* 1.6.0 also offers the 720p scene under the 1080p canvas, upscaled by MetalFX */
+    assert(menu(@"Resolution").numberOfItems == 6 && [menu(@"Resolution").itemTitles.firstObject isEqualToString:@"720p"]);
+    assert([[menu(@"Resolution") itemAtIndex:1].title isEqualToString:@"720p + MetalFX upscaling"]);
+    pick(@"Resolution", @"720p + MetalFX upscaling");
+    assert(runtime_output_mode() == OUTPUT_MODE_720P_METALFX && mfxup_output_enabled() && runtime_output_size_current() == SIZE(1920, 1080));
+#else
     assert(menu(@"Resolution").numberOfItems == 5 && [menu(@"Resolution").itemTitles.firstObject isEqualToString:@"720p"]);
+#endif
     pick(@"Resolution", @"720p"); assert(runtime_output_mode() == OUTPUT_MODE_720P && runtime_output_size_current() == SIZE(1280, 720));
     window_is(720);
     } else {

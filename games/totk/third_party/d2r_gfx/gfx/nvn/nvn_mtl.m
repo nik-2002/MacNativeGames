@@ -17773,7 +17773,8 @@ void botw_wb_stage_encode(void) {
 static _Atomic int g_wb_staged_skip = -1;
 int botw_wb_staged_skip_on(void) {
     int v = atomic_load_explicit(&g_wb_staged_skip, memory_order_relaxed);
-    if (v < 0) { const char *e = getenv("TOTK_WB_STAGED_NOWAIT"); v = !(e && !strcmp(e, "0")); atomic_store(&g_wb_staged_skip, v); }
+    /* Off by default (user 2026-11-01: on, the map's zoom and the item-get panel drew garbled); TOTK_WB_STAGED_NOWAIT=1 turns it on */
+    if (v < 0) { const char *e = getenv("TOTK_WB_STAGED_NOWAIT"); v = e && atoi(e) > 0; atomic_store(&g_wb_staged_skip, v); }
     return v;
 }
 void botw_wb_set_staged_skip(int on) { atomic_store(&g_wb_staged_skip, on != 0); MLOG("[flag] wb_staged_nowait = %d", on != 0); }

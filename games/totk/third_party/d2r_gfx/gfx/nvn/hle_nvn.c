@@ -643,13 +643,11 @@ static _Atomic int g_sync_lag = -1;
    wait), settles for the one before under TOTK_SYNC_LAG. */
 static _Atomic uint64_t g_sub_fence_last, g_sub_fence_prev;
 void nvn_set_sync_lag(int on) { atomic_store(&g_sync_lag, on != 0); LOG("[flag] sync_lag = %d", on != 0); }
-/* Breath of the Wild has it on by default (user 2026-10-28; 1.6.0 Hebra: 8.78 -> 7.29 ms a frame with p95 unchanged, where
-   Tears of the Kingdom's p95 went up to 22 ms and stays off); TOTK_SYNC_LAG=0 turns it off. */
-#ifdef GAME_BOTW
-#define SYNC_LAG_DEFAULT 1
-#else
+/* Off by default for both games; TOTK_SYNC_LAG=1 turns it on. Breath of the Wild had it on from 2026-10-28 (1.6.0 Hebra:
+   8.78 -> 7.29 ms a frame, measured at a static spot only), but the map's zoom and the item-get panel (name and
+   description) then drew garbled: the game takes the wait's return as "the GPU is done" and rewrites what the newest
+   submission still reads (user 2026-11-01). Tears of the Kingdom's p95 went up to 22 ms with it. */
 #define SYNC_LAG_DEFAULT 0
-#endif
 static int sync_lag_on(void) { int v = atomic_load(&g_sync_lag); if (v < 0) { const char *e = getenv("TOTK_SYNC_LAG"); v = e ? atoi(e) > 0 : SYNC_LAG_DEFAULT; atomic_store(&g_sync_lag, v); if (v) LOG("[nvn] TOTK_SYNC_LAG=1：游戏等最近一次提交的 GPU 完成时放宽到上一次提交 | waits for the newest submission settle for the one before it"); } return v; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();

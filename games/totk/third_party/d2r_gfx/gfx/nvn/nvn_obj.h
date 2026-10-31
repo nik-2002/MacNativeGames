@@ -240,7 +240,7 @@ void botw_wb_stage_encode(void);
         if ((list)[i_]->stage_fence > need_) need_ = (list)[i_]->stage_fence; blit_ |= !WB_STAGED((list)[i_]); } if (need_) mtl_wait(need_, UINT64_MAX); \
         if (totk_tl_on()) totk_tl(TL_WB_STEP, 1, need_); \
         if (blit_ || !botw_wb_staged_skip_on()) { while (atomic_load(&g_up_pending)) usleep(1000); if (totk_tl_on()) totk_tl(TL_WB_STEP, 2, 0); } }
-int botw_wb_staged_skip_on(void);   /* TOTK_WB_STAGED_NOWAIT=0 waits for the uploads also for staged lists (the old behaviour) */
+int botw_wb_staged_skip_on(void);   /* TOTK_WB_STAGED_NOWAIT=1 lets staged lists skip the wait for the uploads (off by default) */
 int botw_wb_from_stage(void *e);   /* 1 written back from the stage, 0 failed, WB_POOL_GONE, -1 not staged */
 #define BOTW_WB_FROM_STAGE(e, ok, layers) { int s_ = botw_wb_from_stage(e); if (s_ != -1) { (ok) = s_; (layers) = 0; } }
 /* BOTW (nvn_mtl.m, after a re-upload): the range that tracked the texture can be gone by now (a neighbour pool destroyed,
