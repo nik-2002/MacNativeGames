@@ -17773,8 +17773,9 @@ void botw_wb_stage_encode(void) {
 static _Atomic int g_wb_staged_skip = -1;
 int botw_wb_staged_skip_on(void) {
     int v = atomic_load_explicit(&g_wb_staged_skip, memory_order_relaxed);
-    /* Off by default (user 2026-11-01: on, the map's zoom and the item-get panel drew garbled); TOTK_WB_STAGED_NOWAIT=1 turns it on */
-    if (v < 0) { const char *e = getenv("TOTK_WB_STAGED_NOWAIT"); v = e && atoi(e) > 0; atomic_store(&g_wb_staged_skip, v); }
+    /* On by default; TOTK_WB_STAGED_NOWAIT=0 turns it off. Cleared of the 1.6.0 map-zoom glitch (user 2026-11-01, live A/B:
+       the glitch came back with sync_lag 1 alone and stayed away with wb_staged_nowait 1 alone) */
+    if (v < 0) { const char *e = getenv("TOTK_WB_STAGED_NOWAIT"); v = !(e && !strcmp(e, "0")); atomic_store(&g_wb_staged_skip, v); }
     return v;
 }
 void botw_wb_set_staged_skip(int on) { atomic_store(&g_wb_staged_skip, on != 0); MLOG("[flag] wb_staged_nowait = %d", on != 0); }
