@@ -1,5 +1,15 @@
 # Super Smash Bros. Ultimate port: work log
 
+## 2026-11-01 — pipelines kept between sessions (untested in play)
+
+- **Pipeline hitches:** each session built ~1,100-1,300 pipelines during play again (Oct 30: 24.0 s of building inside
+  long frames; Nov 1: 26.4 s, up to 580 ms at once, still 40 minutes in). From upstream's games/ssbu: the pipeline archive
+  (`totk_pipeline_archive.h`: one Metal binary archive per pipeline in the translation cache, written while the game is
+  idle, taken with FailOnBinaryArchiveMiss; `TOTK_PIPELINE_ARCHIVE=0` turns it off) and `pso_key_norm` (state a pipeline
+  does not use is cleared from its key; upstream found 35% of a warm list compiled twice only for that). Unlike upstream,
+  only pipelines built in play are written: the warm-up's 12,929 take 0.2 ms each already, and their files would hold
+  ~450 MB on an 8 GB Mac. `make probe-pipeline-archive` writes two pipelines and takes them back in a new process.
+
 ## 2026-11-01 — menu clips cost fewer frames (untested in play)
 
 - **Menu clips on an M1:** with a menu clip playing, 172 of 384 300-frame windows ran at ~54 fps (none of 63 without a

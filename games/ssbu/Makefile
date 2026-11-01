@@ -86,6 +86,17 @@ probe-movie-avc: $(OUT)/movie-probe-avc
 	"$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/annexb.bin" "$(WORK)/analysis/movie-probe-avc/ref.nv12" annexb
 	"$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/vp9.bin" "$(WORK)/analysis/movie-probe-avc/ref_vp9.nv12" vp9
 
+# The pipeline archive (third_party/d2r_gfx/gfx/nvn/totk_pipeline_archive.h) on this Mac's GPU: a first process writes a
+# render and a compute pipeline to their files, a second takes both from them with MTLPipelineOptionFailOnBinaryArchiveMiss.
+.PHONY: probe-pipeline-archive
+$(OUT)/pipeline-archive-probe: scripts/pipeline_archive_probe.m third_party/d2r_gfx/gfx/nvn/totk_pipeline_archive.h
+	@mkdir -p "$(dir $@)"
+	xcrun clang -fobjc-arc -O1 -Wall -Wno-unused-function -Wno-unused-variable scripts/pipeline_archive_probe.m -framework Metal -framework Foundation -o "$@"
+probe-pipeline-archive: $(OUT)/pipeline-archive-probe
+	rm -rf "$(WORK)/analysis/pipeline-archive-probe" && mkdir -p "$(WORK)/analysis/pipeline-archive-probe"
+	"$(OUT)/pipeline-archive-probe" "$(WORK)/analysis/pipeline-archive-probe" write
+	"$(OUT)/pipeline-archive-probe" "$(WORK)/analysis/pipeline-archive-probe" read
+
 # The player's mods, made into checked tables: exefs patches (mods/13.0.4/<name>/exefs/*.pchtxt) -> <work>/patches,
 # RomFS mods (mods/<name>/romfs/...) -> their manifest.tsv (sizes and SHA-256 of the replacements and the originals).
 .PHONY: patches mods nros dlc manual app

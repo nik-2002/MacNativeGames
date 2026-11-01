@@ -6463,6 +6463,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
     const nvn_refl *rf = &vs->rf;
     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 16 && a < S.nattr) { k->attr[a] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
+    pso_key_norm(k, lmap);   // one pipeline, one key (nvn_pso_skey.h, from upstream's games/ssbu)
 }
 // ---- 并行预编：首次遇到的管线原先在提交线程一条条同步编，一帧里连着缺 9 条 = 284 ms（真机重场面）。
 // 现在：一次提交里第一次缺管线时，顺着余下的命令往前扫一遍（只重放状态，不画），把后面还会缺的普通通道管线一并丢给后台并行编；
@@ -6477,6 +6478,58 @@ static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是�
 // Statistics line (pso_predict_rest, every 100 scans): guesses refused because the table was full, stale guesses freed,
 // time draws waited for a background compile, scans and which budget ended them.
 static uint64_t g_pp_full, g_pp_reclaimed, g_pp_waits, g_pp_wait_ns, g_pp_scans, g_pp_scan_ns, g_pp_stop[3];
+#include "totk_pipeline_archive.h"
+/* The pipeline archive (totk_pipeline_archive.h, from upstream's games/ssbu, 2026-11-01). Every start compiled the game's
+   pipelines again: a 51-minute session on an M1 spent 22 s building 1,124 pipelines inside long frames (348 frames over
+   16.7 ms of building alone, up to 580 ms, still 40 minutes in), and the warm-up compiled its lists again each start. A
+   pipeline is first asked of its own archive file alone (MTLPipelineOptionFailOnBinaryArchiveMiss). Found: done. Not
+   found: compiled as before and written to its file while the game is idle (par_game_idle). key: pso_archive_key /
+   cs_archive_key; nil = not archived. TOTK_PIPELINE_ARCHIVE=0 turns it off.
+   add: upstream also archives the warm-up's pipelines; here only those built in play are written (add = 1). The warm-up
+   builds 12,929 render pipelines in 2.8 s (0.2 ms each: the system's shader cache has them), so files for them (~35 KB
+   each, kept open: ~450 MB on an 8 GB Mac) would buy nothing; it still takes a pipeline from a file when there is one. */
+static _Atomic uint64_t g_par_hits, g_par_misses;
+static void par_count(int hit) {
+    uint64_t h = hit ? atomic_fetch_add(&g_par_hits, 1) + 1 : atomic_load(&g_par_hits), m = hit ? atomic_load(&g_par_misses) : atomic_fetch_add(&g_par_misses, 1) + 1;
+    if ((h + m) % 1000 == 0) MLOG("管线存档：建管线 %llu 次，从存档取 %llu 次，现编 %llu 次", (unsigned long long)(h + m), (unsigned long long)h, (unsigned long long)m);
+}
+static NSString *pso_archive_key(const pso_key *k, NvShader *vs, NvShader *fs, int merged) {
+    pso_skey sk; pso_skey_from(k, vs, fs, merged, NULL, &sk); return par_hash(&sk, sizeof sk);
+}
+static NSString *cs_archive_key(NvShader *cs) { return cs ? [@"c" stringByAppendingString:par_hash(cs->key, strnlen(cs->key, sizeof cs->key))] : nil; }
+static id<MTLRenderPipelineState> pso_new(MTLRenderPipelineDescriptor *d, NSString *key, int add, NSError **e) {
+    id<MTLRenderPipelineState> ps = nil;
+    id<MTLBinaryArchive> a = par_archive_for(g_dev, key);
+    if (a) {
+        d.binaryArchives = @[a];
+        ps = [g_dev newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:nil];
+        if (ps) { par_count(1); return ps; }
+        d.binaryArchives = nil;
+    }
+    if (key && g_par_on) par_count(0);
+    ps = [g_dev newRenderPipelineStateWithDescriptor:d error:e];
+    atomic_store(&g_par_last_compile_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    if (ps && add) par_add(g_dev, key, d);
+    return ps;
+}
+static id<MTLComputePipelineState> cs_new(NvShader *cs, int add, NSError **e) {
+    if (!cs || !cs->fn) return nil;
+    NSString *key = cs_archive_key(cs);
+    MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new]; d.computeFunction = cs->fn;
+    id<MTLComputePipelineState> ps = nil;
+    id<MTLBinaryArchive> a = par_archive_for(g_dev, key);
+    if (a) {
+        d.binaryArchives = @[a];
+        ps = [g_dev newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:nil];
+        if (ps) { par_count(1); return ps; }
+        d.binaryArchives = nil;
+    }
+    if (g_par_on) par_count(0);
+    ps = [g_dev newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:e];
+    atomic_store(&g_par_last_compile_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    if (ps && add) par_add(g_dev, key, d);
+    return ps;
+}
 static void pso_predict_rest(void);
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
 // Called only with g_pp_mu held. An in-flight worker still owns its slot:
@@ -6496,9 +6549,9 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     if (at < 0 && slot < 0) g_pp_full++;
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
+    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++; NSString *key = pso_archive_key(k, vs, fs, 0);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        NSError *e = nil; id<MTLRenderPipelineState> ps = pso_new(d, key, 1, &e);
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
     });
 }
@@ -6537,7 +6590,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     else {
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : (atfn ? atfn : g_pso_fsfn), g_pso_lmap != NULL);
-        ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        ps = pso_new(d, pso_archive_key(&k, vs, fs, g_pso_lmap != NULL), 1, &e);
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
@@ -6624,6 +6677,12 @@ static NvShader *warm_shader(NSMutableDictionary<NSString *, NvShader *> *dict, 
 enum { WARM_BLOCK = 512 };   // rows per block: the shaders of a block load in parallel, then its rows run in order
 static _Atomic int g_warm_in_play;
 static _Atomic int g_warm_lists_done;   // every list (title, manifest, user, shared, seed) warmed; the cache top-up may still run
+/* totk_pipeline_archive.h writes a new pipeline's file only now: it compiles the pipeline once more. Upstream (TotK) waits
+   for the first world frame; Smash has none, so: the warm-up is over and nothing was compiled for PAR_IDLE_NS. */
+static int par_game_idle(void) {
+    return atomic_load(&g_warm_lists_done) && !atomic_load(&g_warm_running) &&
+           clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - atomic_load(&g_par_last_compile_ns) > PAR_IDLE_NS;
+}
 static int warm_threads(void) {
     static int n; static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -6782,7 +6841,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         }
                         pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
                         NSError *e = nil; uint64_t ps_started = bp_now();
-                        id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e];
+                        id ps = pso_new(pso_desc(&k, vs, fs, fsfn, sk.merged), pso_archive_key(&k, vs, fs, sk.merged), 0, &e);
                         atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
                         if (!ps) { MLOG("【红】后台建渲染管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
@@ -6791,7 +6850,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         NSString *key = c[1]; if (!key.length) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         NvShader *cs = warm_shader(dict, key, 5);
                         if (!cs) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                        NSError *e = nil; uint64_t ps_started = bp_now(); id ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&e];
+                        NSError *e = nil; uint64_t ps_started = bp_now(); id ps = cs_new(cs, 0, &e);
                         atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
                         if (!ps) { MLOG("【红】后台建计算管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         WarmItem *item = [WarmItem new]; item->kind = 2; item->key = key; item->shader = cs; item->object = ps;
@@ -6936,10 +6995,10 @@ static void warm_light(void) {
                 NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil, *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
                 if (!vs || (fkey.length && !fs)) { nfail++; continue; }
                 pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = NULL;
-                NSError *er = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, nil, sk.merged) error:&er]; tried = 1; nr += ps != nil;
+                NSError *er = nil; ps = pso_new(pso_desc(&k, vs, fs, nil, sk.merged), pso_archive_key(&k, vs, fs, sk.merged), 0, &er); tried = 1; nr += ps != nil;
             } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && [c[1] length]) {
                 NvShader *cs = warm_shader(dict, c[1], 5); if (!cs) { nfail++; continue; }
-                NSError *er = nil; ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&er]; tried = 1; nc += ps != nil;
+                NSError *er = nil; ps = cs_new(cs, 0, &er); tried = 1; nc += ps != nil;
             }
             if (tried && !ps) nfail++;
             if (tried && bp_now() - t1 > 20000000ull) slow++;   // > 20 ms: compiled, not a cache hit
@@ -10538,7 +10597,7 @@ static void dispatch(const p_dispatch *dp) {
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
-        NSError *e = nil; uint64_t bt = bp_now(); ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&e];
+        NSError *e = nil; uint64_t bt = bp_now(); ps = cs_new(cs, 1, &e);
         g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
         if (!ps) { MLOG("【红】建计算管线失败：%s", e.localizedDescription.UTF8String); return; }
         if (survey_shader_log()) MLOG("[survey-shader] frame %llu compute pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), cs->key, (bp_now() - bt) / 1e6);
