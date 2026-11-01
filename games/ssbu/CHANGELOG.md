@@ -1,5 +1,12 @@
 # Super Smash Bros. Ultimate port: work log
 
+## 2026-11-01 — H.264 end of stream (review)
+
+- **H.264 clip end:** the end of stream waited until every reordered frame and the end fitted into free outputs at once
+  (held + 1, up to 5 of 8). A player that keeps 4 frames and gives one back only as a new one comes waited forever, the
+  clip frozen 8 frames before its end (the installed a93a33f, `PROBE_KEEP=4`: stuck at frame 67 of 75). The frames now
+  go out as outputs come back and the end follows them; `make probe-movie-avc` runs that case.
+
 ## 2026-11-01 — pipelines kept between sessions (untested in play)
 
 - **Pipeline hitches:** each session built ~1,100-1,300 pipelines during play again (Oct 30: 24.0 s of building inside

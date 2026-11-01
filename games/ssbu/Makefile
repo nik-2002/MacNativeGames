@@ -84,6 +84,7 @@ probe-movie-avc: $(OUT)/movie-probe-avc
 	python3 scripts/movie_probe_avc_inputs.py "$(WORK)/analysis/movie-probe-avc"
 	"$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/lp.bin" "$(WORK)/analysis/movie-probe-avc/ref.nv12" lp
 	"$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/annexb.bin" "$(WORK)/analysis/movie-probe-avc/ref.nv12" annexb
+	PROBE_KEEP=4 "$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/lp.bin" "$(WORK)/analysis/movie-probe-avc/ref.nv12" lp
 	"$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/vp9.bin" "$(WORK)/analysis/movie-probe-avc/ref_vp9.nv12" vp9
 
 # The pipeline archive (third_party/d2r_gfx/gfx/nvn/totk_pipeline_archive.h) on this Mac's GPU: a first process writes a

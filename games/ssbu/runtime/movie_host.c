@@ -73,6 +73,7 @@ typedef struct {
     uint64_t frames, decode_ns, errors, dropped;
     pthread_mutex_t mu;
     int avc;                                 /* H.264 through VideoToolbox (decoder type 1) instead of VP9 */
+    int avc_draining;                        /* the end-of-stream input is decoded; its held frames are going out */
     VTDecompressionSessionRef vt; CMVideoFormatDescriptionRef vt_fmt;
     uint8_t sps[AVC_PARAM], pps[AVC_PARAM]; int nsps, npps;
     struct { uint8_t *nv12; int64_t time; } held[AVC_HOLD]; int nheld;   /* decoded, waiting for presentation order */
@@ -112,7 +113,7 @@ static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
    decode at the movie thread's user-interactive QoS. So the decode takes fewer cores and yields them: libvpx gets
    SSBU_MOVIE_THREADS threads (default 2; 1280x720 VP9 is 0.73 ms a frame at 2 threads against 0.61 at 4 on the M1, ffmpeg
    -benchmark, so a 30 fps clip keeps 30x headroom), and each decode runs at utility QoS (SSBU_MOVIE_QOS=0 keeps the
-   thread's own). libvpx's workers start inside the first decode and so take the lowered QoS too. */
+   thread's own). libvpx's workers start inside the first decode, so they should take the lowered QoS too (not checked). */
 static int movie_threads(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("SSBU_MOVIE_THREADS"); v = e ? atoi(e) : 2; if (v < 1 || v > 8) v = 2; LOG("VP9 decode with %d threads%s", v, getenv("SSBU_MOVIE_QOS") && !strcmp(getenv("SSBU_MOVIE_QOS"), "0") ? "" : " at utility QoS"); }
@@ -394,21 +395,31 @@ static void avc_emit(Movie *m, Signals *s, int all) {
         push_ready(m, s, slot, 0, time, frame_bytes(m)); m->frames++;
     }
 }
+/* End of stream hands over every held frame, then the end. Upstream waited until all of them fitted at once (held + 1
+   outputs free, up to 5 of the 8): a player that keeps 4 frames and gives one back only when a new one comes then waited
+   forever, 8 frames before the end (make probe-movie-avc, PROBE_KEEP=4). Now the frames go out as outputs come back, the
+   input stays queued (avc_draining: decoded once) and the end follows the last of them. */
 static int avc_decode_one(Movie *m, Signals *s, const Pending *p) {
-    int eos = p->flags & FLAG_EOS && !m->eos_in, need = eos ? m->nheld + (p->size > 0) + 1 : p->size > 0;
-    int freeslots = 0; for (int i = 0; i < OUT_BUFS; i++) freeslots += !m->out_held[i];
-    if (freeslots < need) return 0;   /* at most AVC_REORDER + 1 held, + the input's frame and the end: within OUT_BUFS */
-    if (p->size > 0) {
-        uint64_t t0 = now_ns(); qos_class_t q = qos_lower();
-        avc_decode(m, m->in[p->index] + p->offset, p->size, p->time);
-        qos_restore(q); m->decode_ns += now_ns() - t0;
-        if (m->frames && m->frames % 300 == 0) LOG("%llu frames, decode %.2f ms per frame", (unsigned long long)m->frames, m->decode_ns / 1e6 / (double)m->frames);
-    }
-    avc_emit(m, s, 0);
-    if (eos) {
+    int eos = p->flags & FLAG_EOS && !m->eos_in;
+    if (!m->avc_draining) {
+        int freeslots = 0; for (int i = 0; i < OUT_BUFS; i++) freeslots += !m->out_held[i];
+        if (freeslots < (p->size > 0)) return 0;   /* at most AVC_REORDER + 1 held: one output for the frame beyond them */
+        if (p->size > 0) {
+            uint64_t t0 = now_ns(); qos_class_t q = qos_lower();
+            avc_decode(m, m->in[p->index] + p->offset, p->size, p->time);
+            qos_restore(q); m->decode_ns += now_ns() - t0;
+            if (m->frames && m->frames % 300 == 0) LOG("%llu frames, decode %.2f ms per frame", (unsigned long long)m->frames, m->decode_ns / 1e6 / (double)m->frames);
+        }
+        avc_emit(m, s, 0);
+        if (!eos) { give_back(m, p->index); note(m, s, EV_INPUT); return 1; }
         if (m->vt) VTDecompressionSessionWaitForAsynchronousFrames(m->vt);
+        m->avc_draining = 1;
+    }
+    if (eos) {
         avc_emit(m, s, 1);
-        m->eos_in = 1; int slot = free_out(m); if (slot < 0) runtime_fail("movie decoder: no slot for end of stream");
+        if (m->nheld || free_out(m) < 0) return 0;   /* the rest when the game releases outputs (drain_pending) */
+        m->avc_draining = 0;
+        m->eos_in = 1; int slot = free_out(m);
         push_ready(m, s, slot, FLAG_EOS, p->time, 0);
         LOG("H.264 end of stream after %llu frames (%.2f ms per input, %llu errors)", (unsigned long long)m->frames, m->frames ? m->decode_ns / 1e6 / (double)m->frames : 0.0, (unsigned long long)m->errors);
     }
@@ -492,6 +503,7 @@ static void release_codec(Movie *m) {
     m->configured = m->started = 0; m->nin_free = m->npending = m->nready = m->ndecoded = 0; m->t0 = 0;
 }
 static void reset_queues(Movie *m) {
+    m->avc_draining = 0;
     /* buffers the game holds stay the game's: a looping clip (Help > Techniques) fills one with its key frame before the
        flush and sends it after */
     m->nin_free = 0; for (int i = 0; i < IN_BUFS; i++) if (!(m->lent >> i & 1)) m->in_free[m->nin_free++] = i;

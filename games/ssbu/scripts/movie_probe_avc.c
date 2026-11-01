@@ -10,6 +10,7 @@
      vp9     the same check for the VP9 decoder (decoder type 3, libvpx at SSBU_MOVIE_THREADS, utility QoS): a libvpx clip
              from the same script, no reordering
    Stand-ins replace the guest's movie::Buffer, movie::MediaData and nn::os events (as games/totk/scripts/movie_probe.c).
+   PROBE_KEEP=<n>: the player keeps n frames until it sees the end (it gives one back as each new one comes).
    usage: movie-probe-avc <samples.bin> <ref.nv12> lp|annexb|vp9 */
 #include "../runtime/movie_host.h"
 #include <stdarg.h>
@@ -75,7 +76,7 @@ static int cmp_i64(const void *a, const void *b) { int64_t x = *(const int64_t *
 /* One play of the clip: every sample, then end of stream; every output compared, in presentation order. Input buffers
    the player took and did not fill stay its own across a flush, as the game's do (the host gives them out again only
    when they are sent). */
-static int in_free[16], nfree;
+static int in_free[16], nfree, g_keep;
 static int play(void *dec, Event *ev, const Sample *s, int ns, const int64_t *order, const uint8_t *ref, int W, int H, int pass) {
     size_t fb = (size_t)W * H * 3 / 2; uint8_t *dst = malloc(fb); Buf ob = {0};
     int held[16], frame_of[16] = {0}, nheld = 0, next = 0, compared = 0, eos_sent = 0, eos_seen = 0, peak = 0, last = -1;
@@ -105,7 +106,7 @@ static int play(void *dec, Event *ev, const Sample *s, int ns, const int64_t *or
             need(k < ns && k == last + 1, "pass %d: output time %lld is frame %d, expected frame %d (presentation order)", pass, (long long)t, k, last + 1);
             last = k; frame_of[idx] = k; held[nheld++] = idx; if (nheld > peak) peak = nheld;
         }
-        while (nheld && (nheld >= 8 || !nfree || eos_sent)) {
+        while (nheld > (eos_seen ? 0 : g_keep) && (nheld >= 8 || !nfree || eos_sent)) {   /* PROBE_KEEP: the player keeps that many frames until the end */
             buf_set_data(&ob, dst, fb); buf_set_range(&ob, 0, (int)fb);
             need(E(ib_t, MOVIE_GET_OUTPUT)(dec, held[0], &ob) == 0 && ob.offset == 0 && ob.size == (int)fb, "GetOutputBuffer frame %d (size %d)", compared, ob.size);
             size_t fk = (size_t)frame_of[held[0]];
@@ -127,7 +128,7 @@ static int play(void *dec, Event *ev, const Sample *s, int ns, const int64_t *or
 int main(int argc, char **argv) {
     if (argc != 4 || (strcmp(argv[3], "lp") && strcmp(argv[3], "annexb") && strcmp(argv[3], "vp9"))) { fprintf(stderr, "usage: movie-probe-avc <samples.bin> <ref.nv12> lp|annexb|vp9\n"); return 2; }
     const int lp = !strcmp(argv[3], "lp"), vp9 = !strcmp(argv[3], "vp9");
-    setenv("TOTK_MOVIE_PACE", "0", 1);
+    setenv("TOTK_MOVIE_PACE", "0", 1); g_keep = getenv("PROBE_KEEP") ? atoi(getenv("PROBE_KEEP")) : 0;
     MovieGuest api = {signal_event, buf_set_range, buf_set_data, buf_base, buf_capacity, md_find_int32, md_find_string,
                       md_set_int32, md_set_rect, md_set_string, fake_vtable + 0x10, {0}};
     for (int i = 0; i < MOVIE_ENTRIES; i++) api.orig[i] = (void *)orig_other;
