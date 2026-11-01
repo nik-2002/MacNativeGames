@@ -1,5 +1,14 @@
 # Super Smash Bros. Ultimate port: work log
 
+## 2026-11-01 — H.264 movies
+
+- **H.264 clip crash:** ~51 minutes into a session the game opened an H.264 movie (decoder type 1). Only VP9 ran on the
+  host, so it went to the movie library, whose NVDEC decoder is not there: `guest Break`, "original SDK Break". H.264 now
+  decodes on the host through VideoToolbox (ported from upstream's games/ssbu): Annex B or length-prefixed samples, SPS and
+  PPS from csd-0/1, the avcC record or in-band, presentation order through a reorder buffer, and the movie's own size when
+  the format gives none. A flush keeps the session's pictures, as for VP9. `make probe-movie-avc` checks it against
+  ffmpeg's decode of a libx264 clip with B-frames: 150 frames, byte-equal, in both sample forms.
+
 ## 2026-10-26 — crashes, saves, Help pages, controllers
 
 ### Crashes

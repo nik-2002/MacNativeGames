@@ -21,7 +21,11 @@
    would pile up in its own queue), and when the game falls behind (a loading hitch: ~15 fps for a few seconds under the
    blood moon) a frame more than 1.5 frame periods late is dropped if the next one is due too: the picture stays in time
    with the cutscene's sound instead of lagging and then running fast to catch up. TOTK_MOVIE_PACE=0 hands every frame
-   over as soon as it is decoded. Not used by SSBU: see pace_on. */
+   over as soon as it is decoded. Not used by SSBU: see pace_on.
+   H.264 goes through the same entries as decoder type 1 (from upstream's games/ssbu, 2026-11-01: a Smash clip in H.264 was
+   left to the library, whose NVDEC decoder aborted the game ~51 min into a session): VideoToolbox decodes each input (Annex B
+   or length-prefixed NAL units; SPS and PPS are taken wherever they appear and build the session), writes NV12 directly, and
+   a reorder buffer of AVC_REORDER frames hands them over in presentation order, as MediaCodec does; end of stream flushes it. */
 #include "runtime.h"
 #include "movie_host.h"
 #include <arm_neon.h>
@@ -42,9 +46,11 @@ void movie_host_tick(void) {}
 #else
 #include <vpx/vp8dx.h>
 #include <vpx/vpx_decoder.h>
+#include <VideoToolbox/VideoToolbox.h>
 
 enum { IN_BUFS = 4, IN_CAP = 2 << 20, OUT_BUFS = 8, MAX_MOVIES = 16 };
-enum { TYPE_VP9 = 3, MODE_BUFFER = 1, FORMAT_NV12 = 4, FLAG_EOS = 4 };
+enum { TYPE_AVC = 1, TYPE_VP9 = 3, MODE_BUFFER = 1, FORMAT_NV12 = 4, FLAG_EOS = 4 };
+enum { AVC_REORDER = 4, AVC_HOLD = 16, AVC_PARAM = 256 };
 enum { ST_OK = 0, ST_ERROR = 0x1000, ST_NULL = 0x100b, ST_NOT_READY = 0x100c, ST_NO_OUTPUT = 0x100e, ST_NO_INPUT = 0x1011,
        ST_UNSUPPORTED = 0x2001, ST_NOT_CONFIGURED = 0x2002 };
 enum { EV_INPUT, EV_OUTPUT, EV_FORMAT, EV_ERROR };
@@ -65,6 +71,11 @@ typedef struct {
     uint64_t t0; int64_t pts0;               /* paced: host time and presentation time of the first frame handed over */
     uint64_t frames, decode_ns, errors, dropped;
     pthread_mutex_t mu;
+    int avc;                                 /* H.264 through VideoToolbox (decoder type 1) instead of VP9 */
+    VTDecompressionSessionRef vt; CMVideoFormatDescriptionRef vt_fmt;
+    uint8_t sps[AVC_PARAM], pps[AVC_PARAM]; int nsps, npps;
+    struct { uint8_t *nv12; int64_t time; } held[AVC_HOLD]; int nheld;   /* decoded, waiting for presentation order */
+    uint8_t *scratch; size_t scratch_cap;    /* one access unit as 4-byte length-prefixed NAL units */
 } Movie;
 
 static MovieGuest G; static int g_ready;
@@ -210,7 +221,175 @@ static void queue_pending(Movie *m, const Pending *p) {
     if (m->npending >= IN_BUFS) runtime_fail("movie decoder: more queued inputs than input buffers");
     m->pending[m->npending++] = *p;
 }
+
+/* ---- H.264 through VideoToolbox ---- */
+typedef struct { const uint8_t *p; int n; } Nal;
+/* The NAL units of one input: Annex B (start codes) or 4-byte length prefixes; -1 when the lengths do not add up. */
+static int split_nals(const uint8_t *d, int n, Nal *out, int max) {
+    int k = 0;
+    if (n >= 4 && !d[0] && !d[1] && (d[2] == 1 || (!d[2] && d[3] == 1))) {
+        int start = -1;
+        for (int i = 0; i + 3 <= n;) {
+            if (!d[i] && !d[i + 1] && d[i + 2] == 1) {
+                if (start >= 0 && k < max) { int end = i; while (end > start && !d[end - 1]) end--; out[k++] = (Nal){d + start, end - start}; }
+                i += 3; start = i; continue;
+            }
+            i++;
+        }
+        if (start >= 0 && start < n && k < max) out[k++] = (Nal){d + start, n - start};
+        return k;
+    }
+    for (int i = 0; i + 4 <= n && k < max;) {
+        uint32_t len = (uint32_t)d[i] << 24 | (uint32_t)d[i + 1] << 16 | (uint32_t)d[i + 2] << 8 | d[i + 3]; i += 4;
+        if (!len || len > (uint32_t)(n - i)) return -1;
+        out[k++] = (Nal){d + i, (int)len}; i += (int)len;
+    }
+    return k;
+}
+static void avc_close(Movie *m) {
+    if (m->vt) { VTDecompressionSessionWaitForAsynchronousFrames(m->vt); VTDecompressionSessionInvalidate(m->vt); CFRelease(m->vt); m->vt = NULL; }
+    if (m->vt_fmt) { CFRelease(m->vt_fmt); m->vt_fmt = NULL; }
+    for (int i = 0; i < m->nheld; i++) free(m->held[i].nv12);
+    m->nheld = 0;
+}
+/* VideoToolbox output (synchronous: inside VTDecompressionSessionDecodeFrame, under the decoder's lock): copy the NV12
+   planes into a held frame (the picture can be taller than the movie: 360 rows are coded as 368). */
+static void avc_output(void *ref, void *frame, OSStatus st, VTDecodeInfoFlags info, CVImageBufferRef img, CMTime pts, CMTime dur) {
+    Movie *m = ref; (void)frame; (void)info; (void)dur;
+    if (st != noErr || !img) { m->errors++; m->last_error = ST_ERROR; if (m->errors <= 4) LOG("【红】H.264 decode error %d", (int)st); return; }
+    if (m->nheld == AVC_HOLD) runtime_fail("movie decoder: H.264 reorder buffer full");
+    CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
+    int fw = (int)CVPixelBufferGetWidth(img), fh = (int)CVPixelBufferGetHeight(img);
+    if (fw < m->w || fh < m->h || CVPixelBufferGetPlaneCount(img) != 2) {
+        LOG("【红】H.264 frame %dx%d with %zu planes for the configured %dx%d NV12; dropped", fw, fh, CVPixelBufferGetPlaneCount(img), m->w, m->h);
+        CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly); m->errors++; return;
+    }
+    uint8_t *f = malloc((size_t)frame_bytes(m)); if (!f) runtime_fail("movie H.264 frame allocation");
+    const uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(img, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(img, 1);
+    size_t ys = CVPixelBufferGetBytesPerRowOfPlane(img, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(img, 1);
+    for (int r = 0; r < m->h; r++) memcpy(f + (size_t)r * m->w, y + r * ys, (size_t)m->w);
+    for (int r = 0; r < m->h / 2; r++) memcpy(f + (size_t)m->w * m->h + (size_t)r * m->w, uv + r * uvs, (size_t)m->w);
+    CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
+    m->held[m->nheld].nv12 = f; m->held[m->nheld++].time = CMTimeConvertScale(pts, 1000000, kCMTimeRoundingMethod_Default).value;
+}
+static int avc_session(Movie *m) {
+    if (m->vt) return 1;
+    if (!m->nsps || !m->npps) return 0;
+    const uint8_t *sets[2] = {m->sps, m->pps}; size_t sizes[2] = {(size_t)m->nsps, (size_t)m->npps};
+    OSStatus st = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 2, sets, sizes, 4, &m->vt_fmt);
+    if (st) { LOG("【红】H.264 parameter sets rejected: %d", (int)st); m->vt_fmt = NULL; return 0; }
+    /* the movie's own size (SPS, cropped) when the format said another (none: 1920x1080), as VP9 takes its first frame's */
+    CGSize vis = CMVideoFormatDescriptionGetPresentationDimensions(m->vt_fmt, false, true);
+    int vw = (int)vis.width & ~1, vh = (int)vis.height & ~1;
+    if (!m->format_sent && !m->nheld && vw > 0 && vh > 0 && vw <= 8192 && vh <= 8192 && (vw != m->w || vh != m->h)) {
+        LOG("H.264 movie is %dx%d, not the configured %dx%d", vw, vh, m->w, m->h);
+        m->w = vw; m->h = vh;
+        for (int i = 0; i < OUT_BUFS; i++) { void *nb = realloc(m->out[i], (size_t)frame_bytes(m)); if (!nb) runtime_fail("movie output buffers realloc"); m->out[i] = nb; }
+    }
+    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    int pf = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange; CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf);
+    CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, n); CFRelease(n);
+    VTDecompressionOutputCallbackRecord cb = {avc_output, m};
+    st = VTDecompressionSessionCreate(NULL, m->vt_fmt, NULL, attrs, &cb, &m->vt); CFRelease(attrs);
+    if (st) { LOG("【红】VideoToolbox H.264 session: %d", (int)st); CFRelease(m->vt_fmt); m->vt_fmt = NULL; m->vt = NULL; return 0; }
+    LOG("VideoToolbox H.264 session for %dx%d", m->w, m->h);
+    return 1;
+}
+/* An SPS (7) or PPS (8) NAL unit replaces the kept one; returns 1 when it changed. */
+static int avc_param(Movie *m, const uint8_t *p, int n) {
+    int type = p[0] & 31; uint8_t *dst = type == 7 ? m->sps : m->pps; int *len = type == 7 ? &m->nsps : &m->npps;
+    if (n > AVC_PARAM) { LOG("【红】H.264 parameter set of %d bytes ignored", n); return 0; }
+    if (*len == n && !memcmp(dst, p, (size_t)n)) return 0;
+    memcpy(dst, p, (size_t)n); *len = n; return 1;
+}
+/* The format's codec-specific data: csd-0 / csd-1 as MediaCodec has them (Annex B parameter sets), or the MP4 avcC record
+   (version 1, then SPS and PPS each with a 16-bit length) the movie library keeps under "avcc". */
+static void avc_codec_data(Movie *m, const void *format) {
+    static bool (*find_buffer)(const void *, const char *, void **); static void *(*buffer_data)(const void *); static size_t (*buffer_size)(const void *);
+    if (!find_buffer) {
+        need_symbol((void **)&buffer_data, "_ZNK5movie6Buffer4DataEv"); need_symbol((void **)&buffer_size, "_ZNK5movie6Buffer4SizeEv");
+        need_symbol((void **)&find_buffer, "_ZNK5movie9MediaData10FindBufferEPKcPPNS_6BufferE");
+    }
+    static const char *const keys[] = {"csd-0", "csd-1", "csd-2", "avcc", "avcC"};   /* the movie library's own key names */
+    for (int k = 0; k < 5; k++) {
+        void *buf = NULL; if (!find_buffer(format, keys[k], &buf) || !buf) continue;
+        const uint8_t *d = buffer_data(buf); int n = (int)buffer_size(buf); if (!d || n <= 0) continue;
+        if (n > 7 && d[0] == 1) {   /* avcC */
+            int at = 5, count = d[at++] & 31;
+            for (int pass = 0; pass < 2; pass++) {
+                for (int i = 0; i < count && at + 2 <= n; i++) { int len = d[at] << 8 | d[at + 1]; at += 2; if (len <= 0 || at + len > n) break; avc_param(m, d + at, len); at += len; }
+                if (!pass && at < n) count = d[at++];
+            }
+        } else {
+            Nal nals[8]; int c = split_nals(d, n, nals, 8);
+            for (int i = 0; i < c; i++) if ((nals[i].p[0] & 31) == 7 || (nals[i].p[0] & 31) == 8) avc_param(m, nals[i].p, nals[i].n);
+        }
+    }
+    LOG("H.264 parameter sets from the format: SPS %d bytes, PPS %d bytes", m->nsps, m->npps);
+}
+/* One input: parameter sets update the session, the other NAL units (access unit delimiters dropped) are one sample. */
+static void avc_decode(Movie *m, const uint8_t *d, int n, int64_t time) {
+    Nal nals[128]; int k = split_nals(d, n, nals, 128);
+    if (k < 0) { m->errors++; m->last_error = ST_ERROR; if (m->errors <= 4) LOG("【红】H.264 input of %d bytes is neither Annex B nor length-prefixed", n); return; }
+    size_t bytes = 0; int changed = 0;
+    for (int i = 0; i < k; i++) {
+        int type = nals[i].p[0] & 31;
+        if (type == 7 || type == 8) changed |= avc_param(m, nals[i].p, nals[i].n);
+        else if (type != 9) bytes += 4 + (size_t)nals[i].n;
+    }
+    if (changed && m->vt) { VTDecompressionSessionWaitForAsynchronousFrames(m->vt); VTDecompressionSessionInvalidate(m->vt); CFRelease(m->vt); m->vt = NULL; CFRelease(m->vt_fmt); m->vt_fmt = NULL; }
+    if (!bytes) return;
+    if (!avc_session(m)) { m->errors++; m->last_error = ST_ERROR; if (m->errors <= 4) LOG("【红】H.264 slice without a usable SPS and PPS"); return; }
+    if (m->scratch_cap < bytes) { free(m->scratch); m->scratch = malloc(bytes); m->scratch_cap = bytes; if (!m->scratch) runtime_fail("movie H.264 sample buffer"); }
+    size_t at = 0;
+    for (int i = 0; i < k; i++) {
+        int type = nals[i].p[0] & 31; if (type == 7 || type == 8 || type == 9) continue;
+        uint32_t len = (uint32_t)nals[i].n; uint8_t *o = m->scratch + at;
+        o[0] = (uint8_t)(len >> 24); o[1] = (uint8_t)(len >> 16); o[2] = (uint8_t)(len >> 8); o[3] = (uint8_t)len;
+        memcpy(o + 4, nals[i].p, len); at += 4 + len;
+    }
+    CMBlockBufferRef block = NULL; CMSampleBufferRef sample = NULL;
+    CMSampleTimingInfo timing = {.duration = kCMTimeInvalid, .presentationTimeStamp = CMTimeMake(time, 1000000), .decodeTimeStamp = kCMTimeInvalid};
+    if (CMBlockBufferCreateWithMemoryBlock(NULL, m->scratch, bytes, kCFAllocatorNull, NULL, 0, bytes, 0, &block) ||
+        CMSampleBufferCreateReady(NULL, block, m->vt_fmt, 1, 1, &timing, 1, &bytes, &sample)) runtime_fail("movie decoder: H.264 sample buffer");
+    VTDecodeInfoFlags info = 0;
+    OSStatus st = VTDecompressionSessionDecodeFrame(m->vt, sample, 0, NULL, &info);
+    CFRelease(sample); CFRelease(block);
+    if (st) { m->errors++; m->last_error = ST_ERROR; if (m->errors <= 4) LOG("【红】VideoToolbox DecodeFrame: %d at %lld us", (int)st, (long long)time); }
+}
+/* Hand held frames over in presentation order: all of them at end of stream, else those beyond the reorder depth. */
+static void avc_emit(Movie *m, Signals *s, int all) {
+    while (m->nheld > (all ? 0 : AVC_REORDER)) {
+        int best = 0; for (int i = 1; i < m->nheld; i++) if (m->held[i].time < m->held[best].time) best = i;
+        int slot = free_out(m); if (slot < 0) return;
+        memcpy(m->out[slot], m->held[best].nv12, (size_t)frame_bytes(m)); free(m->held[best].nv12);
+        int64_t time = m->held[best].time; m->held[best] = m->held[--m->nheld];
+        if (!m->format_sent) { m->format_sent = 1; if (negative() != 2) note(m, s, EV_FORMAT); }
+        push_ready(m, s, slot, 0, time, frame_bytes(m)); m->frames++;
+    }
+}
+static int avc_decode_one(Movie *m, Signals *s, const Pending *p) {
+    int eos = p->flags & FLAG_EOS && !m->eos_in, need = eos ? m->nheld + (p->size > 0) + 1 : p->size > 0;
+    int freeslots = 0; for (int i = 0; i < OUT_BUFS; i++) freeslots += !m->out_held[i];
+    if (freeslots < need) return 0;   /* at most AVC_REORDER + 1 held, + the input's frame and the end: within OUT_BUFS */
+    if (p->size > 0) {
+        uint64_t t0 = now_ns(); avc_decode(m, m->in[p->index] + p->offset, p->size, p->time); m->decode_ns += now_ns() - t0;
+        if (m->frames && m->frames % 300 == 0) LOG("%llu frames, decode %.2f ms per frame", (unsigned long long)m->frames, m->decode_ns / 1e6 / (double)m->frames);
+    }
+    avc_emit(m, s, 0);
+    if (eos) {
+        if (m->vt) VTDecompressionSessionWaitForAsynchronousFrames(m->vt);
+        avc_emit(m, s, 1);
+        m->eos_in = 1; int slot = free_out(m); if (slot < 0) runtime_fail("movie decoder: no slot for end of stream");
+        push_ready(m, s, slot, FLAG_EOS, p->time, 0);
+        LOG("H.264 end of stream after %llu frames (%.2f ms per input, %llu errors)", (unsigned long long)m->frames, m->frames ? m->decode_ns / 1e6 / (double)m->frames : 0.0, (unsigned long long)m->errors);
+    }
+    give_back(m, p->index); note(m, s, EV_INPUT);
+    return 1;
+}
+
 static int decode_one(Movie *m, Signals *s, const Pending *p) {
+    if (m->avc) return avc_decode_one(m, s, p);
     int need = p->size > 0 ? 1 : 0;
     if (p->flags & FLAG_EOS && !m->eos_in) need++;
     int freeslots = 0; for (int i = 0; i < OUT_BUFS; i++) freeslots += !m->out_held[i];
@@ -273,6 +452,7 @@ static void drain_pending(Movie *m, Signals *s) {
 }
 static void release_codec(Movie *m) {
     if (m->vpx_live) { vpx_codec_destroy(&m->vpx); m->vpx_live = 0; }
+    avc_close(m); m->nsps = m->npps = 0; free(m->scratch); m->scratch = NULL; m->scratch_cap = 0;
     for (int i = 0; i < IN_BUFS; i++) { free(m->in[i]); m->in[i] = NULL; }
     for (int i = 0; i < OUT_BUFS; i++) { free(m->out[i]); m->out[i] = NULL; }
     free(m->key); m->key = NULL; m->key_len = 0; m->need_key = 0;
@@ -292,19 +472,20 @@ static void reset_queues(Movie *m) {
 typedef void (*ctor_fn)(void *, int, int, int, int);
 static void h_ctor(void *obj, int type, int format, int mode, int priority) {
     if (!g_ready) guest_init();
-    if (type != TYPE_VP9 || mode != MODE_BUFFER) {
-        LOG("decoder type %d mode %d format %d: left to the library (only VP9 in buffer mode runs on the host)", type, mode, format);
+    if ((type != TYPE_VP9 && type != TYPE_AVC) || mode != MODE_BUFFER) {
+        LOG("decoder type %d mode %d format %d: left to the library (VP9 and H.264 in buffer mode run on the host)", type, mode, format);
         ((ctor_fn)G.orig[MOVIE_CTOR])(obj, type, format, mode, priority); return;
     }
     Movie *m = calloc(1, sizeof *m); if (!m) runtime_fail("movie decoder allocation");
-    m->guest = obj; m->format = format; pthread_mutex_init(&m->mu, NULL);
+    m->guest = obj; m->format = format; m->avc = type == TYPE_AVC; pthread_mutex_init(&m->mu, NULL);
     pthread_mutex_lock(&g_lock); int i = 0;
     while (i < MAX_MOVIES && g_movies[i] && g_movies[i]->guest != obj) i++;
     if (i == MAX_MOVIES) runtime_fail("movie decoder table full");
     if (g_movies[i]) { LOG("【红】decoder object %p reused without destruction", obj); release_codec(g_movies[i]); free(g_movies[i]); }
     g_movies[i] = m; pthread_mutex_unlock(&g_lock);
     ((void **)obj)[0] = G.vptr; ((void **)obj)[1] = m;
-    LOG("VP9 decoder %p on the host (libvpx %s), output format %d", obj, vpx_codec_version_str(), format);
+    if (m->avc) LOG("H.264 decoder %p on the host (VideoToolbox), output format %d", obj, format);
+    else LOG("VP9 decoder %p on the host (libvpx %s), output format %d", obj, vpx_codec_version_str(), format);
 }
 static void destroy(void *obj) {
     pthread_mutex_lock(&g_lock); Movie *m = NULL;
@@ -330,19 +511,22 @@ static int h_configure(void *obj, void *format) {
     G.md_find_string(format, "mime", &mime); G.md_find_int32(format, "width", &w); G.md_find_int32(format, "height", &h);
     if (w <= 0) w = 1920;
     if (h <= 0) h = 1080;
-    if ((mime && strcmp(mime, "video/x-vnd.on2.vp9")) || w > 8192 || h > 8192 || (w | h) & 1) {
+    if ((mime && strcmp(mime, m->avc ? "video/avc" : "video/x-vnd.on2.vp9")) || w > 8192 || h > 8192 || (w | h) & 1) {
         LOG("【红】configure: mime %s %dx%d not supported", mime ? mime : "(none)", w, h); return ST_UNSUPPORTED;
     }
     pthread_mutex_lock(&m->mu);
     release_codec(m); m->w = w; m->h = h;
-    vpx_codec_dec_cfg_t cfg = {.threads = 4, .w = (unsigned)w, .h = (unsigned)h};
-    if (vpx_codec_dec_init(&m->vpx, vpx_codec_vp9_dx(), &cfg, 0) != VPX_CODEC_OK) runtime_fail("libvpx VP9 decoder initialisation");
-    m->vpx_live = 1;
+    if (m->avc) avc_codec_data(m, format);   /* the session is made at the first slice (avc_session) */
+    else {
+        vpx_codec_dec_cfg_t cfg = {.threads = 4, .w = (unsigned)w, .h = (unsigned)h};
+        if (vpx_codec_dec_init(&m->vpx, vpx_codec_vp9_dx(), &cfg, 0) != VPX_CODEC_OK) runtime_fail("libvpx VP9 decoder initialisation");
+        m->vpx_live = 1;
+    }
     for (int i = 0; i < IN_BUFS; i++) if (!(m->in[i] = malloc(IN_CAP))) runtime_fail("movie input buffers");
     for (int i = 0; i < OUT_BUFS; i++) if (!(m->out[i] = malloc((size_t)frame_bytes(m)))) runtime_fail("movie output buffers");
     m->lent = 0; reset_queues(m); m->format_sent = 0; m->configured = 1; m->last_error = 0;
     pthread_mutex_unlock(&m->mu);
-    LOG("configured %dx%d VP9, %d input buffers of %d KiB, %d output frames of %d bytes", w, h, IN_BUFS, IN_CAP >> 10, OUT_BUFS, frame_bytes(m));
+    LOG("configured %dx%d %s, %d input buffers of %d KiB, %d output frames of %d bytes", w, h, m->avc ? "H.264" : "VP9", IN_BUFS, IN_CAP >> 10, OUT_BUFS, frame_bytes(m));
     return ST_OK;
 }
 static int h_register_events(void *obj, void *events) {
@@ -392,7 +576,11 @@ static int h_flush(void *obj) {
     /* drop queued work and take every input buffer back. The decoder keeps its pictures, as the console's does: a looping
        clip (Help > Techniques) does not always resend its key frame after the flush, and a fresh decoder failed every frame
        until the next loop. */
-    if (m->configured) { reset_queues(m); m->need_key = 1; }
+    if (m->configured && m->avc) {   /* the session keeps its pictures too; only the frames waiting for their order go */
+        if (m->vt) VTDecompressionSessionWaitForAsynchronousFrames(m->vt);
+        for (int i = 0; i < m->nheld; i++) free(m->held[i].nv12);
+        m->nheld = 0; reset_queues(m);
+    } else if (m->configured) { reset_queues(m); m->need_key = 1; }
     pthread_mutex_unlock(&m->mu);
     return ST_OK;
 }
