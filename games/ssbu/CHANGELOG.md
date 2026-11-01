@@ -1,5 +1,13 @@
 # Super Smash Bros. Ultimate port: work log
 
+## 2026-11-01 — menu clips cost fewer frames (untested in play)
+
+- **Menu clips on an M1:** with a menu clip playing, 172 of 384 300-frame windows ran at ~54 fps (none of 63 without a
+  clip; matches 0 of 153). The movie thread decodes, not the main thread (SSBU_MOVIE_TRACE now names the threads), so the
+  decode is made lighter on the cores: libvpx 2 threads instead of 4 (`SSBU_MOVIE_THREADS`) and utility QoS while
+  decoding (`SSBU_MOVIE_QOS=0` keeps the thread's). `make probe-movie-avc` now checks VP9 too, against ffmpeg's native
+  decoder.
+
 ## 2026-11-01 — H.264 movies
 
 - **H.264 clip crash:** ~51 minutes into a session the game opened an H.264 movie (decoder type 1). Only VP9 ran on the

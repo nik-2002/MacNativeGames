@@ -5,6 +5,8 @@
   lp.bin      4-byte length-prefixed samples, SPS and PPS only in the avcC record (passed as the format's "avcc")
   annexb.bin  start-code samples, SPS and PPS in-band before the first slice, no codec data in the format
   ref.nv12    every frame in presentation order, packed NV12
+  vp9.bin     a libvpx VP9 clip of the same size (IVF frames, no codec data), for the VP9 decoder
+  ref_vp9.nv12  ffmpeg's own VP9 decode of it (its native decoder, not libvpx)
 
 Sample file: b"AVCP", u32 width, height, samples, avcC length, the avcC record, then per sample (decode order)
 u32 size, i64 presentation time in microseconds, the bytes.
@@ -60,8 +62,22 @@ def main(out):
             for i, (s, pts) in enumerate(samples):
                 s = convert(s, i == 0)
                 f.write(struct.pack('<Iq', len(s), pts) + s)
+    ivf = out / 'clip.ivf'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', f'testsrc2=size={W}x{H}:rate=30', '-frames:v', str(FRAMES),
+                    '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-g', '40', '-b:v', '2M', '-f', 'ivf', ivf], check=True)
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-c:v', 'vp9', '-i', ivf, '-pix_fmt', 'nv12', '-f', 'rawvideo', out / 'ref_vp9.nv12'], check=True)
+    data = ivf.read_bytes()
+    rate, scale = struct.unpack('<II', data[16:24])
+    frames, at = [], 32
+    while at + 12 <= len(data):
+        n, pts = struct.unpack('<IQ', data[at:at + 12]); at += 12
+        frames.append((data[at:at + n], pts * scale * 1000000 // rate)); at += n
+    with open(out / 'vp9.bin', 'wb') as f:
+        f.write(b'AVCP' + struct.pack('<IIII', W, H, len(frames), 0))
+        for s, pts in frames:
+            f.write(struct.pack('<Iq', len(s), pts) + s)
     (out / 'meta.txt').write_text(f'{W} {H} {len(samples)}\n')
-    print(f'{len(samples)} samples of {W}x{H} H.264, avcC {len(avcc)} bytes, in {out}')
+    print(f'{len(samples)} samples of {W}x{H} H.264 (avcC {len(avcc)} bytes) and {len(frames)} VP9 frames, in {out}')
 
 
 if __name__ == '__main__':

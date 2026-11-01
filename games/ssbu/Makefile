@@ -73,7 +73,8 @@ boot: runtime
 	cd "$(WORK)" && TOTK_HEADLESS=$${TOTK_HEADLESS-} ./build/ssbu-native rewritten/v1304 boot 2> "$(abspath $(SSBU_LOG))"; echo "exit $$?; log: $(SSBU_LOG)"
 
 # The host H.264 movie decoder (runtime/movie_host.c, decoder type 1) against ffmpeg's decode of a libx264 clip with
-# B-frames: length-prefixed samples with an avcC record, and Annex B samples in a format without a size.
+# B-frames: length-prefixed samples with an avcC record, and Annex B samples in a format without a size; and the VP9
+# decoder against ffmpeg's native decode of a libvpx clip.
 .PHONY: probe-movie-avc
 $(OUT)/movie-probe-avc: scripts/movie_probe_avc.c runtime/movie_host.c runtime/movie_host.h runtime/runtime.h
 	@mkdir -p "$(dir $@)"
@@ -83,6 +84,7 @@ probe-movie-avc: $(OUT)/movie-probe-avc
 	python3 scripts/movie_probe_avc_inputs.py "$(WORK)/analysis/movie-probe-avc"
 	"$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/lp.bin" "$(WORK)/analysis/movie-probe-avc/ref.nv12" lp
 	"$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/annexb.bin" "$(WORK)/analysis/movie-probe-avc/ref.nv12" annexb
+	"$(OUT)/movie-probe-avc" "$(WORK)/analysis/movie-probe-avc/vp9.bin" "$(WORK)/analysis/movie-probe-avc/ref_vp9.nv12" vp9
 
 # The player's mods, made into checked tables: exefs patches (mods/13.0.4/<name>/exefs/*.pchtxt) -> <work>/patches,
 # RomFS mods (mods/<name>/romfs/...) -> their manifest.tsv (sizes and SHA-256 of the replacements and the originals).

@@ -30,6 +30,7 @@
 #include "movie_host.h"
 #include <arm_neon.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +105,30 @@ static const char *const NAMES[MOVIE_ENTRIES] = {
 
 #define LOG(...) do { fprintf(stderr, "[movie] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+/* Decoding is not on the game's main thread (2026-11-01, SSBU_MOVIE_TRACE: the movie thread sends every input, the
+   presents come from another), but menu clips still cost frames on an M1 (4 performance cores): a 300-frame window fell to
+   ~54 fps in 172 of 384 windows with a menu clip playing and in none of 63 without one, with libvpx at 4 threads and the
+   decode at the movie thread's user-interactive QoS. So the decode takes fewer cores and yields them: libvpx gets
+   SSBU_MOVIE_THREADS threads (default 2; 1280x720 VP9 is 0.73 ms a frame at 2 threads against 0.61 at 4 on the M1, ffmpeg
+   -benchmark, so a 30 fps clip keeps 30x headroom), and each decode runs at utility QoS (SSBU_MOVIE_QOS=0 keeps the
+   thread's own). libvpx's workers start inside the first decode and so take the lowered QoS too. */
+static int movie_threads(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("SSBU_MOVIE_THREADS"); v = e ? atoi(e) : 2; if (v < 1 || v > 8) v = 2; LOG("VP9 decode with %d threads%s", v, getenv("SSBU_MOVIE_QOS") && !strcmp(getenv("SSBU_MOVIE_QOS"), "0") ? "" : " at utility QoS"); }
+    return v;
+}
+static qos_class_t qos_lower(void) {   /* returns the class to restore, or QOS_CLASS_UNSPECIFIED for nothing changed */
+    static int on = -1; if (on < 0) { const char *e = getenv("SSBU_MOVIE_QOS"); on = !(e && !strcmp(e, "0")); }
+    if (!on) return QOS_CLASS_UNSPECIFIED;
+    qos_class_t q = qos_class_self();
+    if (q == QOS_CLASS_UTILITY || q == QOS_CLASS_BACKGROUND) return QOS_CLASS_UNSPECIFIED;
+    static int told;
+    if (pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0)) { if (!told++) LOG("decode QoS %#x kept (the thread's class cannot change)", q); return QOS_CLASS_UNSPECIFIED; }
+    if (!told++) LOG("decode QoS %#x -> utility (%#x) while decoding", q, qos_class_self());
+    return q == QOS_CLASS_UNSPECIFIED ? QOS_CLASS_DEFAULT : q;
+}
+static void qos_restore(qos_class_t q) { if (q != QOS_CLASS_UNSPECIFIED) pthread_set_qos_class_self_np(q, 0); }
 
 static void need_symbol(void **slot, const char *name) {
     *slot = runtime_symbol(name);
@@ -194,6 +219,7 @@ static void release_due(Movie *m, Signals *s, uint64_t now) {
 }
 void movie_host_tick(void) {   /* lock order g_lock -> Movie.mu, as in destroy; events fire after both are released */
     Signals s = {0};
+    static unsigned ticks; if (getenv("SSBU_MOVIE_TRACE") && !(ticks++ % 120)) { uint64_t tid; pthread_threadid_np(NULL, &tid); LOG("present tick %u on thread %llu", ticks, (unsigned long long)tid); }
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < MAX_MOVIES; i++) {
         Movie *m = g_movies[i]; if (!m) continue;
@@ -373,7 +399,9 @@ static int avc_decode_one(Movie *m, Signals *s, const Pending *p) {
     int freeslots = 0; for (int i = 0; i < OUT_BUFS; i++) freeslots += !m->out_held[i];
     if (freeslots < need) return 0;   /* at most AVC_REORDER + 1 held, + the input's frame and the end: within OUT_BUFS */
     if (p->size > 0) {
-        uint64_t t0 = now_ns(); avc_decode(m, m->in[p->index] + p->offset, p->size, p->time); m->decode_ns += now_ns() - t0;
+        uint64_t t0 = now_ns(); qos_class_t q = qos_lower();
+        avc_decode(m, m->in[p->index] + p->offset, p->size, p->time);
+        qos_restore(q); m->decode_ns += now_ns() - t0;
         if (m->frames && m->frames % 300 == 0) LOG("%llu frames, decode %.2f ms per frame", (unsigned long long)m->frames, m->decode_ns / 1e6 / (double)m->frames);
     }
     avc_emit(m, s, 0);
@@ -410,7 +438,9 @@ static int decode_one(Movie *m, Signals *s, const Pending *p) {
             }
         }
         m->need_key = 0;
+        qos_class_t q = qos_lower();
         vpx_codec_err_t e = vpx_codec_decode(&m->vpx, data, (unsigned)p->size, NULL, 0);
+        qos_restore(q);
         if (e != VPX_CODEC_OK) {
             m->errors++; m->last_error = ST_ERROR; note(m, s, EV_ERROR);
             if (m->errors <= 4) LOG("【红】VP9 decode error on a %d-byte frame at %lld us: %s", p->size, (long long)p->time, vpx_codec_error_detail(&m->vpx) ? vpx_codec_error_detail(&m->vpx) : vpx_codec_err_to_string(e));
@@ -518,7 +548,7 @@ static int h_configure(void *obj, void *format) {
     release_codec(m); m->w = w; m->h = h;
     if (m->avc) avc_codec_data(m, format);   /* the session is made at the first slice (avc_session) */
     else {
-        vpx_codec_dec_cfg_t cfg = {.threads = 4, .w = (unsigned)w, .h = (unsigned)h};
+        vpx_codec_dec_cfg_t cfg = {.threads = (unsigned)movie_threads(), .w = (unsigned)w, .h = (unsigned)h};
         if (vpx_codec_dec_init(&m->vpx, vpx_codec_vp9_dx(), &cfg, 0) != VPX_CODEC_OK) runtime_fail("libvpx VP9 decoder initialisation");
         m->vpx_live = 1;
     }
@@ -615,7 +645,7 @@ static int h_send_input(void *obj, int index, int offset, int size, int64_t time
     if (!m->started) { pthread_mutex_unlock(&m->mu); return ST_ERROR; }
     m->lent &= ~(1u << index);
     Pending p = {index, offset, size, time, flags};
-    if (getenv("SSBU_MOVIE_TRACE")) LOG("input %d: %d bytes at %lld us, flags %#x (eos %d, %d queued)", index, size, (long long)time, flags, m->eos_in, m->npending);
+    if (getenv("SSBU_MOVIE_TRACE")) { uint64_t tid; pthread_threadid_np(NULL, &tid); LOG("input %d: %d bytes at %lld us, flags %#x (eos %d, %d queued), thread %llu", index, size, (long long)time, flags, m->eos_in, m->npending, (unsigned long long)tid); }
     if (m->eos_in && size > 0 && !(flags & FLAG_EOS)) m->eos_in = 0;   /* data after the end: the clip starts over (a loop's key frame
        can come after one more end of stream, sent before the game's reader rewound; dropping it broke the whole next loop) */
     if (m->eos_in) { give_back(m, index); note(m, &s, EV_INPUT); }   /* after end of stream: hand the buffer back */

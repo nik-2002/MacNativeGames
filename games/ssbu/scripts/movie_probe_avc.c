@@ -7,8 +7,10 @@
      lp      length-prefixed samples, SPS and PPS in the format's avcC record, the format names the movie's size
      annexb  start-code samples with in-band SPS and PPS, a format without a size (the host's default 1920x1080 must
              become the movie's own 640x360)
+     vp9     the same check for the VP9 decoder (decoder type 3, libvpx at SSBU_MOVIE_THREADS, utility QoS): a libvpx clip
+             from the same script, no reordering
    Stand-ins replace the guest's movie::Buffer, movie::MediaData and nn::os events (as games/totk/scripts/movie_probe.c).
-   usage: movie-probe-avc <samples.bin> <ref.nv12> lp|annexb */
+   usage: movie-probe-avc <samples.bin> <ref.nv12> lp|annexb|vp9 */
 #include "../runtime/movie_host.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -123,8 +125,8 @@ static int play(void *dec, Event *ev, const Sample *s, int ns, const int64_t *or
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4 || (strcmp(argv[3], "lp") && strcmp(argv[3], "annexb"))) { fprintf(stderr, "usage: movie-probe-avc <samples.bin> <ref.nv12> lp|annexb\n"); return 2; }
-    const int lp = !strcmp(argv[3], "lp");
+    if (argc != 4 || (strcmp(argv[3], "lp") && strcmp(argv[3], "annexb") && strcmp(argv[3], "vp9"))) { fprintf(stderr, "usage: movie-probe-avc <samples.bin> <ref.nv12> lp|annexb|vp9\n"); return 2; }
+    const int lp = !strcmp(argv[3], "lp"), vp9 = !strcmp(argv[3], "vp9");
     setenv("TOTK_MOVIE_PACE", "0", 1);
     MovieGuest api = {signal_event, buf_set_range, buf_set_data, buf_base, buf_capacity, md_find_int32, md_find_string,
                       md_set_int32, md_set_rect, md_set_string, fake_vtable + 0x10, {0}};
@@ -144,15 +146,16 @@ int main(int argc, char **argv) {
     }
     qsort(order, (size_t)ns, sizeof *order, cmp_i64);
     int reordered = 0; for (int i = 0; i < ns; i++) reordered += s[i].pts != order[i];
-    need(reordered > 0, "the clip has B-frames (decode order differs from presentation order)");
+    need(vp9 ? reordered == 0 : reordered > 0, vp9 ? "VP9: presentation order is decode order" : "the clip has B-frames (decode order differs from presentation order)");
 
-    void *dec[2] = {0}; E(ctor_t, MOVIE_CTOR)(dec, 1, 4, 1, 16);
-    need(dec[0] == fake_vtable + 0x10 && dec[1] != NULL, "H.264 decoder: library vtable, host state at +8");
+    void *dec[2] = {0}; E(ctor_t, MOVIE_CTOR)(dec, vp9 ? 3 : 1, 4, 1, 16);
+    need(dec[0] == fake_vtable + 0x10 && dec[1] != NULL, "host decoder: library vtable, host state at +8");
     Event ev[4] = {{0}}; void *events[4] = {&ev[0], &ev[1], &ev[2], &ev[3]};
     need(E(md_t, MOVIE_REGISTER_EVENTS)(dec, events) == 0, "RegisterClientEvents");
-    Md bad = {0}; md_set_string(&bad, "mime", "video/x-vnd.on2.vp9"); md_set_int32(&bad, "width", W); md_set_int32(&bad, "height", H);
-    need(E(md_t, MOVIE_CONFIGURE)(dec, &bad) == 0x2001, "VP9 format refused by the H.264 decoder");
-    Md fmt = {0}; md_set_string(&fmt, "mime", "video/avc"); Buf rec = {0, (int)avcc_n, (void *)avcc, avcc_n};
+    Md bad = {0}; md_set_string(&bad, "mime", vp9 ? "video/avc" : "video/x-vnd.on2.vp9"); md_set_int32(&bad, "width", W); md_set_int32(&bad, "height", H);
+    need(E(md_t, MOVIE_CONFIGURE)(dec, &bad) == 0x2001, "the other codec's format is refused");
+    Md fmt = {0}; md_set_string(&fmt, "mime", vp9 ? "video/x-vnd.on2.vp9" : "video/avc"); Buf rec = {0, (int)avcc_n, (void *)avcc, avcc_n};
+    if (vp9) { md_set_int32(&fmt, "width", W); md_set_int32(&fmt, "height", H); }
     if (lp) { md_set_int32(&fmt, "width", W); md_set_int32(&fmt, "height", H); md_set_buffer(&fmt, "avcc", &rec); }
     need(E(md_t, MOVIE_CONFIGURE)(dec, &fmt) == 0, "Configure");
     need(E(int_t, MOVIE_START)(dec) == 0 && ev[0].count == 1, "Start signals input available");
