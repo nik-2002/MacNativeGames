@@ -612,15 +612,41 @@ static void patch_output_res(Module *m){
    function itself: on the Mac its first patched word branches to a stub that keeps x19 on the data page (+48):
      stub+0  adrp x3, <data page>   stub+4  str x19, [x3, #48]   stub+8  b main+0x585e4c
    in the text padding's free 32 bytes at +288 (after the bounce veneer, before the Vert+ stubs). The iOS export keeps
-   the plain adrp: the phone has no settings panel switch. */
-enum { RENDER_STUB=288, RENDER_PTR=48, RENDER_MODE=0xcd0 };
+   the plain adrp: the phone has no settings panel switch.
+   The update compares the mode only when bit 13 of renderer+0xca4 is set (main+0x581434 tbnz w9, #13; cleared at
+   main+0x581fbc once the mode is handled). The -1 alone was taken only when the game happened to set that bit itself
+   (user 2026-11-02: 720p render and 720p + MetalFX, chosen after starting in 720p and going to 1080p, kept the 1920x1080
+   scene; the overlay and the upscale's source said 1920x1080), so render_reread sets it too. The game's thread writes
+   that word with plain loads and stores, which can drop a bit set from here, so render_rearm sets it again until the
+   mode byte is no longer -1 (the size function ran), for up to 10 s (the settings panel may be open meanwhile). */
+enum { RENDER_STUB=288, RENDER_PTR=48, RENDER_MODE=0xcd0, RENDER_FLAGS=0xca4, RENDER_MODE_PENDING=1u<<13 };
 static uint8_t *render_page;static unsigned render_w,render_h;static int render_canvas;
+static _Atomic int render_rearming;
+static void *render_rearm(void *arg){
+    uint64_t r=(uint64_t)(uintptr_t)arg;int8_t *mode=(int8_t *)(uintptr_t)(r+RENDER_MODE);uint32_t *flags=(uint32_t *)(uintptr_t)(r+RENDER_FLAGS);
+    int i=0,armed=0;
+    for(;i<200&&__atomic_load_n(mode,__ATOMIC_SEQ_CST)==-1;i++){
+        if(!(__atomic_load_n(flags,__ATOMIC_SEQ_CST)&RENDER_MODE_PENDING)){__atomic_fetch_or(flags,RENDER_MODE_PENDING,__ATOMIC_SEQ_CST);armed++;}
+        usleep(50000);
+    }
+    int done=__atomic_load_n(mode,__ATOMIC_SEQ_CST)!=-1;
+    atomic_store(&render_rearming,0);
+    fprintf(stderr,done?"[totk] 1.4.3 render resolution: the renderer read the size again (mode %d, %d ms, flag set %d times)\n":
+                        "[totk] 1.4.3 render resolution: the renderer did not read the size again within 10 s (mode %d, %d ms, flag set %d times)\n",
+            (int)__atomic_load_n(mode,__ATOMIC_SEQ_CST),i*50,armed);
+    return NULL;
+}
 static void render_reread(void){
     if(!render_page)return;
     uint64_t r=atomic_load((_Atomic uint64_t *)(void *)(render_page+RENDER_PTR));
     if(!r)return;   /* the renderer has not set a mode yet: it reads the size when it does */
     __atomic_store_n((int8_t *)(uintptr_t)(r+RENDER_MODE),(int8_t)-1,__ATOMIC_SEQ_CST);
+    __atomic_fetch_or((uint32_t *)(uintptr_t)(r+RENDER_FLAGS),RENDER_MODE_PENDING,__ATOMIC_SEQ_CST);
     fprintf(stderr,"[totk] 1.4.3 render resolution: the renderer reads the size again at the next frame\n");
+    pthread_t t;
+    if(!atomic_exchange(&render_rearming,1)){
+        if(pthread_create(&t,NULL,render_rearm,(void *)(uintptr_t)r))atomic_store(&render_rearming,0);else pthread_detach(t);
+    }
 }
 static void render_res_publish(unsigned canvas_w){
     if(!render_page)return;
