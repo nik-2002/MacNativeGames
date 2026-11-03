@@ -1009,20 +1009,27 @@ def metal_compiler():
 METAL_FLAGS = ['-fmetal-math-mode=safe']
 
 
-def variant_folder(game):
+def variant_folders(game, app=None):
     """Where the game keeps the source of each patched shader variant it compiled while it was played (nvn_mtl.m
     variant_library: sampler border colours, missing varyings, the layer index, no depth output, MetalFX roles), named by
-    its SHA-256: the player's shader cache, ~/Library/Application Support/MacNativeGames/<game>/shader-cache/rt-<chain>."""
-    return Path.home()/'Library/Application Support/MacNativeGames'/APPS[game][2]/'shader-cache/rt-totk-native-v8-unverified/variants'
+    its SHA-256: the player's shader cache, rt-<chain> in the installed app's cache bundle (SHADER_CACHE_DIR) when it has
+    one, and ~/Library/Application Support/MacNativeGames/<game>/shader-cache, where it was before (and still is for an
+    app without the bundle)."""
+    chain = 'rt-totk-native-v8-unverified/variants'
+    found = [app / SHADER_CACHE_DIR / chain] if app else []
+    return found + [Path.home()/'Library/Application Support/MacNativeGames'/APPS[game][2]/'shader-cache'/chain]
 
 
-def variant_sources(game):
+def variant_sources(game, app=None):
     """The recorded variant sources whose name is their SHA-256 (anything else is left out). Compiled ahead with the
     startup shaders, they are loaded by the game instead of compiled when a draw first needs them: 80-225 ms each on the
     submit thread with a cold Metal cache, and most of those draws cannot be deferred (2026-10-22)."""
-    folder = variant_folder(game)
-    found = sorted(folder.glob('*.metal')) if folder.is_dir() else []
-    return [p for p in found if len(p.stem) == 64 and sha256(p) == p.stem]
+    found = {}
+    for folder in variant_folders(game, app):
+        for p in sorted(folder.glob('*.metal')) if folder.is_dir() else []:
+            if len(p.stem) == 64 and p.stem not in found and sha256(p) == p.stem:
+                found[p.stem] = p
+    return sorted(found.values())
 
 
 def place_variant_libs(tree, res, version):
@@ -1034,7 +1041,7 @@ def place_variant_libs(tree, res, version):
             clone(lib, res/'build/shader-libs'/lib.name)
 
 
-def step_shader_libs(tree, logs, *, version='v0'):
+def step_shader_libs(tree, logs, *, version='v0', app=None):
     """Compile the startup shaders ahead of time. Metal's own cache of shaders compiled at launch does not follow the
     app to a folder whose path has another length (step_warm_metal); these files go inside the app. Each is named by the
     SHA-256 of its source, so the game loads only an exact match, and a rebuild reuses every shader that did not change."""
@@ -1058,7 +1065,7 @@ def step_shader_libs(tree, logs, *, version='v0'):
         digest = seed_sha256(src.parent, src.name, known)
         if not (libs/f'{digest}.metallib').is_file():
             todo.setdefault(digest, src)
-    variants = variant_sources('botw' if version.startswith('botw') else 'totk')
+    variants = variant_sources('botw' if version.startswith('botw') else 'totk', app)
     for src in variants:
         if not (libs/f'{src.stem}.metallib').is_file():
             todo.setdefault(src.stem, src)
@@ -1257,6 +1264,51 @@ def place_data_bundle(bundle, app, res, version):
     link.symlink_to(os.path.relpath(app / 'Contents/Helpers' / bundle.name / 'Contents/Resources/romfs.bin', link.parent))
 
 
+SHADER_CACHE_BUNDLE = 'Contents/Helpers/ShaderCache.bundle'
+SHADER_CACHE_DIR = SHADER_CACHE_BUNDLE + '/Contents/Resources'   # app/launcher.m: the player's shader cache, rt-<chain>
+
+
+def place_cache_bundle(app, logs, *, bundle_id=BUNDLE_ID):
+    """An empty signed bundle in Contents/Helpers that the game keeps its shader cache in (Tears of the Kingdom; the user,
+    2026-11-03: the caches inside the app, the profiles and saves outside it), so the app carries its warmed shaders when
+    it is copied to another Mac. The app's seal records only the bundle's signature (app_seal_valid is not --deep, as for
+    the game data), so the files the game writes into it later leave the app's seal valid; only the bundle's own seal
+    then lists them as added, and nothing checks that. Kept across packagings by keep_shader_cache."""
+    bundle = app / SHADER_CACHE_BUNDLE
+    if bundle.exists():
+        return
+    import plistlib
+    (bundle / 'Contents/Resources').mkdir(parents=True)
+    (bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps(dict(
+        CFBundleIdentifier=f'{bundle_id}.shader-cache', CFBundleName='Shader cache', CFBundlePackageType='BNDL',
+        CFBundleShortVersionString='1', CFBundleVersion='1')))
+    run(['codesign', '--force', '--sign', '-', bundle], logs / 'sign-shader-cache.log')
+
+
+def empty_shader_cache(app):
+    """The cache folders of an app clone being assembled (update_runtime.py), moved out of it and deleted in the
+    background (90,000 files): keep_shader_cache brings the installed app's own, as they are once the game has closed."""
+    cache = app / SHADER_CACHE_DIR
+    for entry in sorted(cache.iterdir()) if cache.is_dir() else ():
+        aside = app.with_name(f'{app.name}.cache-{entry.name}.old')
+        if aside.exists():
+            remove_tree(aside)
+        entry.rename(aside)
+        remove_in_background(aside)
+
+
+def keep_shader_cache(new, old, moves):
+    """The installed app's shader cache folders (rt-<chain>), moved into the new app's cache bundle (an APFS rename, the
+    same volume). Called when the old app no longer runs, before it is replaced; the moves go back with the rest when
+    the installation fails. A folder the new app already has is left where it is."""
+    have, keep = old / SHADER_CACHE_DIR, new / SHADER_CACHE_DIR
+    if not have.is_dir() or not keep.is_dir():
+        return
+    for entry in sorted(have.iterdir()):
+        if not (keep / entry.name).exists():
+            moves.move(entry, keep / entry.name)
+
+
 def app_seal_valid(app):
     """The app's own seal, which records each helper bundle's signature (not --deep: that hashes the 16 GB image)."""
     return subprocess.run(['codesign', '--verify', '--strict', app], capture_output=True).returncode == 0
@@ -1361,6 +1413,8 @@ def install_app(new, out, *, verify=None, remove=None):
         kept = out.exists() and keep_game_data(new, out, verify=verify, _moves=moves)
         if not kept and not verify(new):
             raise BuildError(f'{new}: the new app\'s signature does not verify (codesign --verify --strict); the installed app is unchanged')
+        if out.exists():
+            keep_shader_cache(new, out, moves)
         leftovers = sorted(out.parent.glob(f'{glob.escape(out.name)}.replaced-*'))
         if out.exists():
             # The .app folder itself stays: macOS keeps its first-run check of an app (Gatekeeper / XProtect read the whole
@@ -1464,6 +1518,8 @@ def step_app(tree, out, logs, *, version="v0", game='totk'):
     place_game_data(tree, res, version)
     place_runtime(tree, tmp, version, logs, game=game)
     place_data_bundle(data_bundle(tree, version, logs, bundle_id=bundle_id), tmp, res, version)
+    if game == 'totk':
+        place_cache_bundle(tmp, logs, bundle_id=bundle_id)
     info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable=executable, CFBundleIdentifier=bundle_id, CFBundleName=app_name,
                 CFBundleDisplayName=app_name, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
                 CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
@@ -1998,7 +2054,7 @@ def main(argv):
         step_code_botw(tree, botw, update or game, keys, env, logs, version=version)
         step_data_botw(tree, botw, game, keys, logs, version=version, update=update, dlc=dlcs, firmware=firmware, shared_fonts=shared_fonts)
         step_shaders_botw(tree, botw, logs, version=version)
-        step_shader_libs(tree, logs, version=version)
+        step_shader_libs(tree, logs, version=version, app=out)
         # The work folder's copy of games/botw (prepare_work), relative: make splits a path with spaces into several targets
         step_binary(tree, game, keys, {**env, 'SHADER_LIST': '../botw/assets/shader_list.tsv'}, logs, version=version, title='01007ef00011e000')
         say(f'4/4 app: assembling {out}')
@@ -2061,7 +2117,7 @@ def main(argv):
     if mod:
         check_mod_overlays(tree, mod, version)
     step_shaders(tree, logs, version=version)
-    step_shader_libs(tree, logs, version=version)
+    step_shader_libs(tree, logs, version=version, app=out)
     step_binary(tree, game, keys, env, logs, version=version)
     say(f'4/4 app: assembling {out}')
     if device_app:

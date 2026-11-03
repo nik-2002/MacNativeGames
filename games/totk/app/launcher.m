@@ -1,7 +1,8 @@
 // The launcher inside the packaged app (build_app.py compiles it as Contents/MacOS/TOTK).
-// The game itself is Contents/Resources/totk/build/totk-native; everything it writes goes to the player's own folders:
+// The game itself is Contents/Resources/totk/build/totk-native; what it writes goes to the player's own folders:
 //   ~/Library/Application Support/MacNativeGames/TOTK/   profile (account, saves; players/<id> for each further player,
-//                                                        players.h), shader cache, game slot, RomFS proof (BotW/ for Breath of the Wild)
+//                                                        players.h), game slot, RomFS proof (BotW/ for Breath of the Wild)
+//   Contents/Helpers/ShaderCache.bundle in the app       the shader cache (in the data folder for an app without it)
 //   ~/Library/Logs/MacNativeGames/totk.log             this run, only with the debug log on (totk.previous.log: the one before; botw.log for Breath of the Wild)
 // If the game is already running, the launcher only brings it to the front.
 #import <AppKit/AppKit.h>
@@ -184,7 +185,24 @@ int main(int argc, char **argv) {
         NSString *(^env_or)(const char *, NSString *) = ^NSString *(const char *name, NSString *fallback) {
             const char *v = getenv(name); return v && *v ? @(v) : fallback; };
         NSString *slot = env_or("TOTK_GAME_SLOT_DIR", [data stringByAppendingPathComponent:@"game-slot"]);
-        NSString *cache = env_or("TOTK_SHADER_CACHE", [data stringByAppendingPathComponent:[NSString stringWithFormat:@"shader-cache/rt-%s", DMSH_CHAIN]]);
+        /* The shader cache lives in the app (build_app.py place_cache_bundle; the user, 2026-11-03: the caches inside the
+           app, the profiles and saves outside it), so a copy of the app on another Mac starts with the shaders warm. The
+           app's seal records only that bundle's signature, so what the game writes there leaves it valid. The cache that
+           was in the data folder moves in once (a rename on the same volume). An app without the bundle, or one where it
+           cannot be written (a read-only volume), keeps the cache in the data folder as before. */
+        NSString *chainDir = [NSString stringWithFormat:@"rt-%s", DMSH_CHAIN];
+        NSString *outside = [[data stringByAppendingPathComponent:@"shader-cache"] stringByAppendingPathComponent:chainDir];
+        NSString *inside = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Contents/Helpers/ShaderCache.bundle/Contents/Resources"];
+        NSString *cache = env_or("TOTK_SHADER_CACHE", nil);
+        if (!cache && access(inside.fileSystemRepresentation, W_OK) == 0) {
+            cache = [inside stringByAppendingPathComponent:chainDir];
+            NSFileManager *fm = NSFileManager.defaultManager;
+            NSError *error = nil;
+            if ([fm fileExistsAtPath:outside] && ![fm fileExistsAtPath:cache] && ![fm moveItemAtPath:outside toPath:cache error:&error])
+                fprintf(stderr, "[launcher] shader cache: cannot move %s into the app (%s); starting a new one there\n",
+                        outside.fileSystemRepresentation, error.localizedDescription.UTF8String ?: "unknown error");
+        }
+        if (!cache) cache = outside;
         if (!make_dir(slot) || !make_dir(cache) || !make_dir(logs)) {
             show_error([NSString stringWithFormat:@"Cannot create %@.", data]);
             return 1;

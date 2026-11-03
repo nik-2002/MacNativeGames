@@ -34,7 +34,7 @@ class VariantLibs(unittest.TestCase):
 
     def build(self):
         with patch.object(build_app, 'metal_compiler', return_value=(str(self.compiler), 'fake 1', dict(os.environ))), \
-                patch.object(build_app, 'variant_folder', return_value=self.variants), patch.object(build_app, 'say'):
+                patch.object(build_app, 'variant_folders', return_value=[self.variants]), patch.object(build_app, 'say'):
             build_app.step_shader_libs(self.tree, self.logs, version='v143')
 
     def test_variants_are_compiled_with_the_startup_shaders_and_listed(self):

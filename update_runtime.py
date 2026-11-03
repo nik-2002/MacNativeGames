@@ -103,7 +103,7 @@ def check_work_files(tree, data, version):
                          f'cannot make its startup shaders (pass --work <the work folder of the app\'s build>)')
 
 
-def make_seed(tree, work, game, version, logs, env):
+def make_seed(tree, work, game, version, logs, env, app=None):
     """A new startup shader seed from the work folder's RomFS and modules, as build_app.py makes it (steps 3/4), the
     libraries compiled ahead for it, and the tool step_warm_metal compiles them into Metal's cache with when it cannot."""
     say('making the startup shaders from the work folder\'s game files (a few minutes; no game file or keys)')
@@ -111,7 +111,7 @@ def make_seed(tree, work, game, version, logs, env):
         build_app.step_shaders_botw(tree, work / 'botw', logs, version=version)
     else:
         build_app.step_shaders(tree, logs, version=version)
-    build_app.step_shader_libs(tree, logs, version=version)
+    build_app.step_shader_libs(tree, logs, version=version, app=app)
     build_app.build_warm_tool(tree, logs, env)
 
 
@@ -239,7 +239,8 @@ def record_commit(tmp):
 
 def restore_replaced(app, replaced):
     """Put the replaced app back after the updated one failed its check: the replaced Contents return to the same folder,
-    with the game data bundle the update kept (keep_game_data moved it into the new Contents). Returns the failed app's
+    with the game data bundle the update kept (keep_game_data moved it into the new Contents) and the shader cache
+    (keep_shader_cache). Returns the failed app's
     folder, outside the app."""
     failed = app.with_name(f'{app.name}.failed-{os.getpid()}')
     if failed.exists():
@@ -255,6 +256,10 @@ def restore_replaced(app, replaced):
         if not (helpers / bundle.name).exists():
             helpers.mkdir(parents=True, exist_ok=True)
             bundle.rename(helpers / bundle.name)
+    have, keep = failed / build_app.SHADER_CACHE_DIR, app / build_app.SHADER_CACHE_DIR   # and the shader cache it moved in
+    for entry in sorted(have.iterdir()) if have.is_dir() and keep.is_dir() else ():
+        if not (keep / entry.name).exists():
+            entry.rename(keep / entry.name)
     return failed
 
 
@@ -316,7 +321,7 @@ def main(argv):
         check_work_files(tree, data, version)
         if not stale:
             say('   the app\'s startup shaders are of this runtime\'s translation chain; making them again as asked (--seed)')
-        make_seed(tree, work, game, version, logs, env)
+        make_seed(tree, work, game, version, logs, env, app=app)
     say('building the runtime from this repository (the game binary, the launcher, the shader tools)')
     run(['make', f'-j{os.cpu_count() or 4}', 'binary' if version == 'v0' else f'binary-{version}'], logs / 'runtime.log', cwd=tree, env=env)
     build_app.build_launcher(tree, version, logs, env)
@@ -329,6 +334,11 @@ def main(argv):
         build_app.remove_tree(tmp)
     build_app.copy_tree(app, tmp)   # one APFS clone of the whole app
     try:
+        if game == 'totk':   # the shader cache inside the app (build_app.place_cache_bundle); the installed one moves in at the end
+            if (tmp / build_app.SHADER_CACHE_BUNDLE).exists():
+                build_app.empty_shader_cache(tmp)
+            else:
+                build_app.place_cache_bundle(tmp, logs, bundle_id=APPS[game][1])
         new_res = tmp / 'Contents/Resources/totk'
         new_data = new_res / f'build/game-data/{version}'
         if data != res / f'build/game-data/{version}':
