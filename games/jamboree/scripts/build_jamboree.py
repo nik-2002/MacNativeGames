@@ -235,10 +235,21 @@ def environment(work):
     for key in ('TMPDIR', 'NUGET_PACKAGES', 'DOTNET_CLI_HOME'):
         Path(env[key]).mkdir(parents=True, exist_ok=True)
     # The translator's apphost looks only in the default install locations; a Homebrew .NET is elsewhere.
-    dotnet = shutil.which('dotnet', path=os.pathsep.join([env.get('PATH', ''), '/opt/homebrew/bin', '/usr/local/bin']))
-    if 'DOTNET_ROOT' not in env and dotnet:
-        env['DOTNET_ROOT'] = str(Path(dotnet).resolve().parent)
+    if 'DOTNET_ROOT' not in env and (root := dotnet_root(env)):
+        env['DOTNET_ROOT'] = root
     return env
+
+
+def dotnet_root(env):
+    """The folder holding shared/Microsoft.NETCore.App of the dotnet on PATH (a Homebrew dotnet is a wrapper script elsewhere)."""
+    dotnet = shutil.which('dotnet', path=os.pathsep.join([env.get('PATH', ''), '/opt/homebrew/bin', '/usr/local/bin']))
+    if not dotnet:
+        return None
+    listing = subprocess.run([dotnet, '--list-runtimes'], capture_output=True, text=True, env=env).stdout
+    for line in listing.splitlines():
+        if line.startswith('Microsoft.NETCore.App ') and line.endswith(']'):
+            return str(Path(line[line.index('[') + 1:-1]).parent.parent)
+    return None
 
 
 def main():

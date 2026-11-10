@@ -100,12 +100,12 @@ class BuildTests(unittest.TestCase):
     def test_dotnet_root_follows_the_installed_dotnet(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            (root / 'libexec').mkdir()
-            (root / 'libexec/dotnet').write_text('')
+            shared = root / 'libexec/shared/Microsoft.NETCore.App'
             (root / 'bin').mkdir()
-            (root / 'bin/dotnet').symlink_to(root / 'libexec/dotnet')
-            with mock.patch.dict(os.environ, {'PATH': '/usr/bin'}, clear=False), \
-                 mock.patch.object(build.shutil, 'which', return_value=str(root / 'bin/dotnet')):
+            wrapper = root / 'bin/dotnet'   # like Homebrew's: a script outside the install folder
+            wrapper.write_text(f'#!/bin/sh\necho "Microsoft.NETCore.App 10.0.14 [{shared}]"\n')
+            wrapper.chmod(0o755)
+            with mock.patch.dict(os.environ, {'PATH': str(root / 'bin')}, clear=False):
                 os.environ.pop('DOTNET_ROOT', None)
                 self.assertEqual(build.environment(root / 'work')['DOTNET_ROOT'], str(root / 'libexec'))
 
