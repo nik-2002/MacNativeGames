@@ -228,6 +228,39 @@ static void pad_read(GCExtendedGamepad *g) {
     dm_pad_set_player(p, m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
+// Motion sensors (GCMotion: DualSense, DualShock 4, Switch controllers where macOS reports them) go to dm_motion_set for the controller's player. GameController's frame for a
+// gamepad is the sensor's (x right, y away from the player, z up out of the face, gravity pointing down) and its rotation rate is in radians / s; controllers that report
+// gravity and user acceleration apart give their sum. The first reading is logged, so a frame that differs shows lying flat as something other than (0, 0, -1).
+// DM_MOTION=0 leaves every controller's sensor at rest (Space still shakes player 1's)
+static int g_motion_off;
+static void motion_read(GCMotion *mo) {
+    GCController *c = mo.controller;
+    int p = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c); if (p < 0) return;
+    GCAcceleration a = mo.hasGravityAndUserAcceleration
+        ? (GCAcceleration){mo.gravity.x + mo.userAcceleration.x, mo.gravity.y + mo.userAcceleration.y, mo.gravity.z + mo.userAcceleration.z} : mo.acceleration;
+    GCRotationRate w = mo.hasRotationRate ? mo.rotationRate : (GCRotationRate){0, 0, 0};
+    float acc[3] = {(float)a.x, (float)a.y, (float)a.z}, gyro[3] = {(float)(w.x / (2 * M_PI)), (float)(w.y / (2 * M_PI)), (float)(w.z / (2 * M_PI))};
+    dm_motion_set(p, acc, gyro);
+}
+static void motion_start(GCController *c, int p) {
+    GCMotion *mo = c.motion;
+    if (g_motion_off || !mo) { LOG("controller '%s': %s, player %d's six-axis sensor rests", pad_name(c), g_motion_off ? "motion off (DM_MOTION=0)" : "no motion sensors", p + 1); return; }
+    if (mo.sensorsRequireManualActivation) mo.sensorsActive = YES;
+    __block int logged = 0;
+    mo.valueChangedHandler = ^(GCMotion *m) {
+        motion_read(m);
+        if (!logged) {
+            logged = 1; GCAcceleration a = m.hasGravityAndUserAcceleration ? m.gravity : m.acceleration;
+            LOG("controller '%s': motion for player %d, first reading gravity (%.2f, %.2f, %.2f) G%s", pad_name(m.controller), p + 1, a.x, a.y, a.z,
+                m.hasRotationRate ? "" : ", no gyroscope");
+        }
+    };
+}
+static void motion_stop(GCController *c, int p) {
+    GCMotion *mo = c.motion;
+    if (mo) { mo.valueChangedHandler = nil; if (mo.sensorsRequireManualActivation) mo.sensorsActive = NO; }
+    dm_motion_clear(p);
+}
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
 // Called at start and on every connect / disconnect (gone: the controller that was just removed, nil on a connect)
 static void pads_changed(GCController *gone) {
@@ -236,7 +269,9 @@ static void pads_changed(GCController *gone) {
         for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone) {
             any = 1; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
             pad_read(c.extendedGamepad);
+            if (!c.motion.valueChangedHandler) motion_start(c, 0);
         }
+        if (gone) motion_stop(gone, 0);   // another controller's next reading takes player 1's motion over
         if (!any) { dm_pad_set(0, 0, 0, 0, 0); dm_haptics_apple_controller(0, nil); }
         return;
     }
@@ -244,6 +279,7 @@ static void pads_changed(GCController *gone) {
     for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p] && (g_held[p] == gone || ![now containsObject:g_held[p]])) {
         npad_name(p, nb, sizeof nb); LOG("controller '%s' disconnected: player %d (npad %s) is free", pad_name(g_held[p]), p + 1, nb);
         g_held[p].extendedGamepad.valueChangedHandler = nil;
+        motion_stop(g_held[p], p);
         dm_haptics_apple_controller(p, nil);
         pad_slot_free(&g_slots, (__bridge const void *)g_held[p]); g_held[p] = nil;
         dm_pad_set_player(p, 0, 0, 0, 0, 0);   // nothing stays pressed
@@ -256,11 +292,13 @@ static void pads_changed(GCController *gone) {
         npad_name(p, nb, sizeof nb); LOG("controller '%s' connected: player %d (npad %s), face buttons by %s", pad_name(c), p + 1, nb,
                                          pad_face_swap_abxy(c) ? "Nintendo labels" : "Xbox / PlayStation positions");
         pad_read(c.extendedGamepad);
+        motion_start(c, p);
     }
     dm_pad_players(pad_slot_mask(&g_slots));
 }
 static void pads_start(void) {
     const char *e = getenv("DM_PAD_MERGE"); g_merge = e && atoi(e);
+    e = getenv("DM_MOTION"); g_motion_off = e && !atoi(e);
     e = getenv("DM_KBD_PLAYER"); g_kbd_own = !g_merge && e && !strcmp(e, "own");
     static const char kbd = 0;
     if (g_kbd_own) pad_slot_take(&g_slots, &kbd, "keyboard");   // holds player 1 for good

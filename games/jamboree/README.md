@@ -71,6 +71,9 @@ Open the generated `.app`. Keyboard defaults:
 | Q / E / Z / C | L / R / ZL / ZR |
 | Return / Tab | Plus / Minus |
 | F / G | Left / right stick click |
+| Space | Shake player 1's controller |
+
+**Motion.** A controller whose motion sensors macOS exposes (GameController `GCMotion`: DualSense, DualShock 4, and Switch controllers where macOS reports them) drives its player's six-axis sensor: acceleration and gyroscope as read, angle and direction integrated on the guest clock with gravity correcting tilt. Controllers without motion, and the keyboard, keep a resting sensor lying flat. The log records each controller's first gravity reading (`(0, 0, -1)` lying flat). `DM_MOTION=0` turns real motion off.
 
 The macOS menu exposes face-button layout (`auto`, Nintendo labels, Xbox/PlayStation positions), A/B swap and full screen. `auto` recognizes Nintendo-style controller names; a manual choice is useful when a controller reports a generic name. These settings persist in `controller-layout.txt`. Keyboard inputs are unaffected by controller face-button remapping. Physical button presses, motion input and multi-controller play have **not** been verified for this contribution.
 

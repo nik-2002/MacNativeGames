@@ -7,7 +7,8 @@ static int checks, fails, g_mode = 1, g_signals;
 static void *g_signalled;
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); } } while (0)
 int dm_opmode(void) { return g_mode; }
-uint64_t guest_ns(void) { return 1000000000ull; }
+static uint64_t g_now = 1000000000ull;
+uint64_t guest_ns(void) { return g_now; }
 uint64_t now_ns(void) { return 1000000000ull; }
 uint64_t dm_guest_frame(void) { return 0; }
 void dm_touch_set(const dm_touch *t, int n) { (void)t; (void)n; }
@@ -146,10 +147,58 @@ static void t_vibration(void) {
     CHECK(!h_hid_VibPermit(), "disconnecting the last output disables vibration");
 }
 
+// Controller motion (dm_motion_set): the controller's own readings replace the resting sensor, the gyroscope turns angle and direction, gravity holds the tilt
+static int near(double a, double b, double eps) { return fabs(a - b) < eps; }
+static void t_motion(void) {
+    uint32_t h = 0x0100 | 0;   // player 2's full-key sensor
+    SixAxisState s[4];
+    g_mode = 1; ids((const uint32_t[]){0, 1, NPAD_HANDHELD}, 3); dm_pad_players(0x3); g_now = 2000000000ull;
+    CHECK(six_states(s, 1, h) == 1 && s[0].acc[2] == -1 && s[0].dir[0] == 1 && s[0].dir[8] == 1, "no motion reported: player 2's sensor rests flat");
+    const float up_right[3] = {-1, 0, 0}, still[3] = {0, 0, 0};   // standing on its left edge: gravity along -x
+    dm_motion_set(1, up_right, still);
+    six_states(s, 1, h);
+    CHECK(s[0].acc[0] == -1 && s[0].acc[2] == 0, "the controller's acceleration is reported");
+    CHECK(near(s[0].dir[2], 1, 1e-4) && near(s[0].dir[6], -1, 1e-4), "the first reading's tilt sets the direction: x points up, z sideways");
+    dm_motion_clear(1);
+
+    // A quarter turn about z at 1 rev/s for 0.25 s, lying flat, in 5 ms readings
+    const float flat[3] = {0, 0, -1}, spin[3] = {0, 0, 1};
+    dm_motion_set(1, flat, still);
+    for (int i = 0; i < 50; i++) { g_now += 5000000; dm_motion_set(1, flat, spin); }
+    six_states(s, 2, h);
+    CHECK(near(s[0].angle[2], 0.25, 1e-3) && s[0].gyro[2] == 1, "the angle sums the angular velocity in revolutions");
+    CHECK(near(s[0].dir[0], 0, 0.02) && near(s[0].dir[1], 1, 0.02) && near(s[0].dir[3], -1, 0.02) && near(s[0].dir[8], 1, 1e-3), "a quarter turn left: x points along y");
+    CHECK(near(s[1].angle[2], 0.245, 1e-3), "the previous sample is the reading 5 ms earlier");
+    CHECK(!h_hid_SixRest(&h), "turning: not at rest");
+    for (int i = 0; i < 400; i++) { g_now += 5000000; dm_motion_set(1, flat, still); }
+    CHECK(h_hid_SixRest(&h), "held still lying flat: at rest");
+
+    // Tilted 0.1 rev about x with the gyroscope silent (drift): gravity pulls the direction to the measured tilt in a few seconds
+    dm_motion_clear(1); dm_motion_set(1, flat, still);
+    const float tilted[3] = {0, (float)-sin(0.2 * M_PI), (float)-cos(0.2 * M_PI)};
+    for (int i = 0; i < 1000; i++) { g_now += 5000000; dm_motion_set(1, tilted, still); }
+    six_states(s, 1, h);
+    CHECK(near(s[0].dir[8], cos(0.2 * M_PI), 0.01) && near(fabs(s[0].dir[7]), sin(0.2 * M_PI), 0.01), "gravity corrects the tilt");
+
+    // One-player game: player 2's controller feeds player 1, its motion too; player 1's own wins once it reports
+    ids((const uint32_t[]){0, NPAD_HANDHELD}, 2);
+    uint32_t h1 = 0x0000 | 0;
+    six_states(s, 1, h1);
+    CHECK(near(s[0].acc[1], tilted[1], 1e-6), "merged player 2's motion shows on player 1");
+    dm_motion_set(0, up_right, still);
+    six_states(s, 1, h1);
+    CHECK(s[0].acc[0] == -1, "player 1's own controller motion first");
+    dm_motion_clear(0); dm_motion_clear(1);
+    six_states(s, 1, h1);
+    CHECK(s[0].acc[2] == -1 && s[0].acc[0] == 0, "cleared: the resting sensor again");
+    dm_pad_players(0x1);
+}
+
 int main(void) {
     t_slots();
     t_npads();
     t_vibration();
+    t_motion();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

@@ -22,6 +22,11 @@ void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry
 void dm_pad_set_player(int player, uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);   // player 0..DM_PLAYERS-1 (player 1..8)
 void dm_pad_players(uint32_t mask);   // bit p: player p + 1 has a controller; player 1 always counts as connected (the keyboard, the touch gamepad, DM_KEYS)
 uint32_t dm_player_npad(int player);  // the npad id the game reads player p + 1 on: Handheld (0x20) or No1 (0) for player 1, No n (id n - 1) for player n
+// Controller motion sensors (Mac GameController GCMotion): player p's reading in the six-axis sensor's frame, x right, y away from the player, z up out of the face; acc in G with
+// gravity included and pointing down ((0, 0, -1) lying flat), gyro in revolutions / s, right-handed about those axes. hle_hid.c integrates angle and direction on the guest clock.
+// A player with no reading since dm_motion_clear has the resting sensor (shaken by DM_BTN_SHAKE for player 1)
+void dm_motion_set(int player, const float acc[3], const float gyro[3]);
+void dm_motion_clear(int player);
 
 // Optional diagnostic DM_HID_RECEIPT_LOG=<writable JSONL path>: received samples of real GetNpadState returns.
 // Fields read_start_ns/time_ns use the same host now_ns(); the front-end publish window must use the same helper, and a read interval that spans a publish must not be force-matched.
