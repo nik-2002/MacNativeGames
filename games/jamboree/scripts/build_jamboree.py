@@ -152,6 +152,19 @@ def resume(work, source, language):
     return build, lang
 
 
+def make_icon(image, icns, scratch):
+    """The game's own icon (the control data's icon.jpg) as an .icns, at every size Finder and the Dock ask for."""
+    iconset = scratch / 'AppIcon.iconset'
+    iconset.mkdir(parents=True)
+    for size in (16, 32, 128, 256, 512):
+        for scale in (1, 2):
+            name = f'icon_{size}x{size}' + ('@2x' if scale == 2 else '') + '.png'
+            subprocess.run(['sips', '-s', 'format', 'png', '-z', str(size * scale), str(size * scale), str(image),
+                            '--out', str(iconset / name)], check=True, capture_output=True)
+    subprocess.run(['iconutil', '-c', 'icns', str(iconset), '-o', str(icns)], check=True)
+    shutil.rmtree(iconset)
+
+
 def copy_game_tree(src, dst):
     """APFS clones where the volume allows them (cp falls back to a full copy), so the RomFS is not stored twice."""
     subprocess.run(['cp', '-c', '-R', '-p', str(src), str(dst)], check=True)
@@ -198,8 +211,12 @@ def package(source, build, output, language):
         copy_game_tree(libraries, resources / 'shader-cache' / libraries.name)
         shutil.copy2(build / 'tools/dmhost', resources / 'dmhost')
         (resources / 'language.txt').write_text(language + '\n')
+        icon = {}
+        if (build / 'extract/v458752/icon.jpg').is_file():
+            make_icon(build / 'extract/v458752/icon.jpg', partial / 'Contents/Resources/AppIcon.icns', build / 'tmp')
+            icon = {'CFBundleIconFile': 'AppIcon'}
         with (partial / 'Contents/Info.plist').open('wb') as stream:
-            plistlib.dump({'CFBundleExecutable': 'Jamboree', 'CFBundleIdentifier': 'org.macnativegames.jamboree',
+            plistlib.dump({**icon, 'CFBundleExecutable': 'Jamboree', 'CFBundleIdentifier': 'org.macnativegames.jamboree',
                           'CFBundleName': APP_NAME, 'CFBundleDisplayName': APP_NAME,
                           'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': '2.3.0',
                           'CFBundleVersion': '458752', 'LSMinimumSystemVersion': '26.0',

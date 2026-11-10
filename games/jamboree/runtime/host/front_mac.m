@@ -321,22 +321,24 @@ static void pads_start(void) {
 static DmSettingsMenu *g_settings_menu_target;
 static void install_controller_menu(NSMenu *bar) {
     g_settings_menu_target = [DmSettingsMenu new];
-    NSMenu *controller = [[NSMenu alloc] initWithTitle:@"控制器"];
-    const char *titles[] = {"自动（推荐）", "按位置（Xbox / PlayStation）", "按标签（Nintendo）"};
+    NSMenu *controller = [[NSMenu alloc] initWithTitle:dm_settings_text(@"控制器", @"Controller")];
+    NSArray<NSString *> *titles = @[dm_settings_text(@"自动（推荐）", @"Automatic (recommended)"),
+                                    dm_settings_text(@"按位置（Xbox / PlayStation）", @"By position (Xbox / PlayStation)"),
+                                    dm_settings_text(@"按标签（Nintendo）", @"By label (Nintendo)")];
     for (int i = 0; i < 3; i++) {
-        NSMenuItem *item = [controller addItemWithTitle:@(titles[i]) action:@selector(chooseFaceLayout:) keyEquivalent:@""];
+        NSMenuItem *item = [controller addItemWithTitle:titles[i] action:@selector(chooseFaceLayout:) keyEquivalent:@""];
         item.target = g_settings_menu_target;
         item.tag = i;
         g_face_items[i] = item;
     }
     [controller addItem:NSMenuItem.separatorItem];
-    g_swap_item = [controller addItemWithTitle:@"交换 A / B" action:@selector(toggleSwapAB:) keyEquivalent:@""];
+    g_swap_item = [controller addItemWithTitle:dm_settings_text(@"交换 A / B", @"Swap A / B") action:@selector(toggleSwapAB:) keyEquivalent:@""];
     g_swap_item.target = g_settings_menu_target;
-    [controller addItemWithTitle:@"恢复控制器默认设置" action:@selector(resetController:) keyEquivalent:@""].target = g_settings_menu_target;
-    [[bar addItemWithTitle:@"控制器" action:nil keyEquivalent:@""] setSubmenu:controller];
+    [controller addItemWithTitle:dm_settings_text(@"恢复控制器默认设置", @"Reset controller settings") action:@selector(resetController:) keyEquivalent:@""].target = g_settings_menu_target;
+    [[bar addItemWithTitle:controller.title action:nil keyEquivalent:@""] setSubmenu:controller];
 
-    NSMenu *view = [[NSMenu alloc] initWithTitle:@"显示"];
-    g_fullscreen_item = [view addItemWithTitle:@"下次启动时全屏" action:@selector(toggleStartFullscreen:) keyEquivalent:@""];
+    NSMenu *view = [[NSMenu alloc] initWithTitle:dm_settings_text(@"显示", @"Display")];
+    g_fullscreen_item = [view addItemWithTitle:dm_settings_text(@"下次启动时全屏", @"Full screen at next launch") action:@selector(toggleStartFullscreen:) keyEquivalent:@""];
     g_fullscreen_item.target = g_settings_menu_target;
     NSMenu *outputs = [[NSMenu alloc] initWithTitle:dm_settings_text(@"输出尺寸上限", @"Output size cap")];
     NSArray<NSString *> *names = @[dm_settings_text(@"自动（随窗口）", @"Automatic (window size)"), @"720p", @"1080p", @"1440p", @"2160p"];
@@ -347,7 +349,7 @@ static void install_controller_menu(NSMenu *bar) {
     [[view addItemWithTitle:outputs.title action:nil keyEquivalent:@""] setSubmenu:outputs];
     g_hints_item = [view addItemWithTitle:dm_settings_text(@"快捷键提示", @"Shortcut hints") action:@selector(toggleHints:) keyEquivalent:@""];
     g_hints_item.target = g_settings_menu_target;
-    [[bar addItemWithTitle:@"显示" action:nil keyEquivalent:@""] setSubmenu:view];
+    [[bar addItemWithTitle:view.title action:nil keyEquivalent:@""] setSubmenu:view];
     pad_apply_settings();
 }
 
@@ -465,17 +467,18 @@ void front_run(void (*guest)(void)) {
         }];
         [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
                                                       usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
-        // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
+        // Lifecycle (hle.h / dm.h): minimized → 3 + audio paused + GPU suspended, restored → resume in focus (1). A window that only loses key status
+        // keeps the game in focus with its input released: Jamboree takes OutOfFocus (2) as the HOME menu and stops drawing, which left a black window
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
         [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (win.screen) { g_screen_fps = (int)win.screen.maximumFramesPerSecond; g_layer.contentsScale = win.backingScaleFactor; } screen_match_apply(); }];
         // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
         [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
         [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
-        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_btn = 0; g_w = g_a = g_s = g_d = 0; push(); if (!win.miniaturized) dm_focus_set(2); }];
+        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_btn = 0; g_w = g_a = g_s = g_d = 0; push(); }];
         [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
-        [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
+        [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(1); }];
         // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty)
         static guest_arg ga; ga.fn = guest;
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);

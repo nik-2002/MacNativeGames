@@ -180,6 +180,16 @@ class BuildTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     build.main()
 
+    def test_icon_from_game_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / 'icon.png'
+            subprocess.run(['sips', '-s', 'format', 'png', '-z', '256', '256', '/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns',
+                            '--out', str(image)], check=True, capture_output=True)
+            build.make_icon(image, root / 'AppIcon.icns', root / 'scratch')
+            self.assertGreater((root / 'AppIcon.icns').stat().st_size, 1000)
+            self.assertFalse((root / 'scratch/AppIcon.iconset').exists())
+
     def test_game_tree_copy_preserves_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             src, dst = Path(tmp) / 'RomFS', Path(tmp) / 'app/RomFS'
