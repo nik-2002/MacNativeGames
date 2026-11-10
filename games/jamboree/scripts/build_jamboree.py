@@ -234,6 +234,10 @@ def environment(work):
                MACOSX_DEPLOYMENT_TARGET='26.0')
     for key in ('TMPDIR', 'NUGET_PACKAGES', 'DOTNET_CLI_HOME'):
         Path(env[key]).mkdir(parents=True, exist_ok=True)
+    # The translator's apphost looks only in the default install locations; a Homebrew .NET is elsewhere.
+    dotnet = shutil.which('dotnet', path=os.pathsep.join([env.get('PATH', ''), '/opt/homebrew/bin', '/usr/local/bin']))
+    if 'DOTNET_ROOT' not in env and dotnet:
+        env['DOTNET_ROOT'] = str(Path(dotnet).resolve().parent)
     return env
 
 

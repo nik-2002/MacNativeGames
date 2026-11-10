@@ -97,6 +97,18 @@ class BuildTests(unittest.TestCase):
                 self.assertTrue(Path(env[key]).is_relative_to(work))
                 self.assertTrue(Path(env[key]).is_dir())
 
+    def test_dotnet_root_follows_the_installed_dotnet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / 'libexec').mkdir()
+            (root / 'libexec/dotnet').write_text('')
+            (root / 'bin').mkdir()
+            (root / 'bin/dotnet').symlink_to(root / 'libexec/dotnet')
+            with mock.patch.dict(os.environ, {'PATH': '/usr/bin'}, clear=False), \
+                 mock.patch.object(build.shutil, 'which', return_value=str(root / 'bin/dotnet')):
+                os.environ.pop('DOTNET_ROOT', None)
+                self.assertEqual(build.environment(root / 'work')['DOTNET_ROOT'], str(root / 'libexec'))
+
     def test_rejects_unsupported_build_before_rewrite(self):
         path = GAME / 'third_party/nxnative/build_ipa_from_nsp.py'
         spec = importlib.util.spec_from_file_location('nsp_builder_test', path)
