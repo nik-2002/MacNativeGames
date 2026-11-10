@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Build the isolated Jamboree macOS target from original local inputs."""
 import argparse
+import getpass
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -101,6 +103,60 @@ def verify_originals(build):
     return pins
 
 
+def resume(work, source, language):
+    """Finish from the 2.3.0 extraction already in the work directory, when the original containers are gone.
+    Runs the orchestrator's own Mac stages after extraction; each is reused while its fingerprint holds."""
+    build = work / 'input' / f'{TITLE}_build'
+    extracted = build / 'extract/v458752'
+    if not (extracted / 'RomFS').is_dir() or not (extracted / 'control.nacp').is_file():
+        raise ValueError(f'no 2.3.0 extraction to resume from: {extracted}')
+    verify_originals(build)
+    spec = importlib.util.spec_from_file_location('build_ipa_from_nsp', source / 'scripts/build_ipa_from_nsp.py')
+    nx = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nx)
+    repo = nx.find_repo(source / 'scripts/build_ipa_from_nsp.py')
+    for rel in ('dm/tools', 'dm/games'):
+        sys.path.insert(0, str(repo / rel))
+    import game as gamemod, nacp, profile_guess
+    nx.pg, nx.nacp = profile_guess, nacp   # module globals main() would set
+    g = gamemod.by_title(int(TITLE, 16))
+    if g is None or (bad := nx.build_mismatch(extracted, 'v458752', g)):
+        raise ValueError(f'extraction is not the registered 2.3.0 build: {bad if g else "no game profile"}')
+    # The same environment main() gives its stages: tool paths, workers, and every path inside the build folder.
+    env = dict(environment(work), PATH=os.pathsep.join([os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')] + nx.TOOL_PATHS),
+               DM_ROOT=str(build), WORK=str(build / 'tmp'))
+    env.setdefault('USER', getpass.getuser())
+    env.setdefault('J', str(os.cpu_count() or 8))
+    (build / 'tmp').mkdir(exist_ok=True)
+    py, logs, xlate = sys.executable, build / 'logs', repo / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'
+    nx.PROG.mode = nx.progress_mode('lines')
+    try:
+        nx.check_prereqs(env, xlate, mac=True)
+        lang = nx.game_language(language, True, nacp.languages(extracted / 'control.nacp'))
+        src = profile_guess.build_sources(extracted / 'ExeFS', extracted / 'RomFS', g.words('modules'))
+        extra = [k for k in ('glslc_capture', 'ue_decode', 'oodle_packs', 'ue_legacy') if src[k][0]]
+        if src['graphics'][0] != 'nvn' or extra:
+            raise ValueError(f'resume covers only the NVN shader chain: {src["graphics"][0]} {" ".join(extra)}')
+        nx.PROG.plan(4)
+        patched = build / 'patched_v458752'
+        nx.rewrite(py, repo, extracted / 'ExeFS', patched, env, logs, g)
+        nx.chain_header(py, repo, env, logs)
+        shader = build / 'shader'
+        key = nx.split_shaders(py, repo, [extracted / 'RomFS'], [extracted / 'ExeFS/main'], shader / 'pkg', env, logs, g)
+        libraries = nx.build_shaders(py, repo, shader, xlate, env, logs, g, key, mac=True)
+        nx.mac_run(py, repo, build, extracted, patched, libraries, None, 'nvn', lang, env, logs, g)
+    except nx.BuildError as error:
+        raise ValueError(str(error)) from error
+    finally:
+        nx.PROG.close(ok=False)
+    return build, lang
+
+
+def copy_game_tree(src, dst):
+    """APFS clones where the volume allows them (cp falls back to a full copy), so the RomFS is not stored twice."""
+    subprocess.run(['cp', '-c', '-R', '-p', str(src), str(dst)], check=True)
+
+
 def package(source, build, output, language):
     """Package only after the source build succeeds. Never rewrite a patched binary."""
     if output.suffix != '.app':
@@ -137,9 +193,9 @@ def package(source, build, output, language):
         for src, name in [(build / 'extract/v458752/RomFS', 'RomFS'),
                           (build / 'patched_v458752', 'patched'), (build / 'font', 'font'),
                           (profile, 'profile')]:
-            shutil.copytree(src, resources / name)
+            copy_game_tree(src, resources / name)
         (resources / 'shader-cache').mkdir()
-        shutil.copytree(libraries, resources / 'shader-cache' / libraries.name)
+        copy_game_tree(libraries, resources / 'shader-cache' / libraries.name)
         shutil.copy2(build / 'tools/dmhost', resources / 'dmhost')
         (resources / 'language.txt').write_text(language + '\n')
         with (partial / 'Contents/Info.plist').open('wb') as stream:
@@ -183,10 +239,12 @@ def environment(work):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('inputs', type=Path, help='folder with base NSP/XCI and 2.3.0 update NSP')
-    parser.add_argument('--keys', required=True, type=Path, help='your local prod.keys (never copied into the app)')
-    parser.add_argument('--libhac-package', required=True, type=Path,
+    parser.add_argument('inputs', nargs='?', type=Path, help='folder with base NSP/XCI and 2.3.0 update NSP')
+    parser.add_argument('--keys', type=Path, help='your local prod.keys (never copied into the app)')
+    parser.add_argument('--libhac-package', type=Path,
                         help='local LibHac 0.19.0 .nupkg (SHA-256 pinned; no download)')
+    parser.add_argument('--resume', action='store_true',
+                        help='finish from the 2.3.0 extraction already in --work-dir (no containers, keys or LibHac)')
     parser.add_argument('--work-dir', required=True, type=Path, help='private build directory outside the checkout')
     parser.add_argument('--output', required=True, type=Path, help='new .app output path')
     parser.add_argument('--language', default='en-US', choices=('en-US', 'en-GB', 'ja', 'fr', 'de', 'es-419', 'es', 'it', 'nl', 'fr-CA', 'ru', 'ko', 'zh-Hant', 'zh-Hans', 'pt-BR'), help='game language, e.g. en-US or zh-Hans')
@@ -197,6 +255,17 @@ def main():
     checkout = GAME.parents[1]
     if any(path == checkout or checkout in path.parents for path in (work, output)):
         parser.error('--work-dir and --output must be outside the checkout to keep game content out of Git')
+    if args.resume:
+        if args.inputs or args.keys or args.libhac_package:
+            parser.error('--resume builds from the existing extraction; give no inputs, --keys or --libhac-package')
+        if not work.is_dir():
+            parser.error(f'--resume needs an existing work directory: {work}')
+        source = stage(work)
+        build, language = resume(work, source, args.language)
+        package(source, build, output, language)
+        return
+    if not (args.inputs and args.keys and args.libhac_package):
+        parser.error('inputs, --keys and --libhac-package are required (or --resume)')
     if not args.inputs.expanduser().is_dir() or not args.keys.expanduser().is_file():
         parser.error('inputs folder and keys must exist')
     work.mkdir(parents=True, exist_ok=True)

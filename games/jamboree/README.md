@@ -34,7 +34,15 @@ python3 games/jamboree/scripts/build_jamboree.py \
   --language en-US
 ```
 
-Use `--language zh-Hans` for Simplified Chinese. The builder checks the game's supported languages and records the selection in the app. Give a new output path for each build; an existing app is never replaced. Both the work directory and app output must be outside the Git checkout. Allow at least **25 GB free**, more when keeping several app builds. The first shader build takes several minutes and the packaging step copies the private game data into the app.
+Use `--language zh-Hans` for Simplified Chinese. The builder checks the game's supported languages and records the selection in the app. Give a new output path for each build; an existing app is never replaced. Both the work directory and app output must be outside the Git checkout. Allow at least **25 GB free**, more when keeping several app builds. The first shader build takes several minutes and the packaging step copies the private game data into the app (as APFS clones when the app is on the work directory's volume, so the RomFS is not stored twice).
+
+If the original containers are no longer available but the work directory holds a complete 2.3.0 extraction, finish the build with `--resume` instead of the inputs, `--keys` and `--libhac-package`. The extracted ExeFS modules must still match the pinned hashes; the rewrite, shader split, Mac shaders and host then run as usual, each reused when its inputs are unchanged:
+
+```sh
+python3 games/jamboree/scripts/build_jamboree.py --resume \
+  --work-dir /path/to/private/Jamboree-build \
+  --output '/path/to/private/Super Mario Party Jamboree.app'
+```
 
 Alternatively:
 

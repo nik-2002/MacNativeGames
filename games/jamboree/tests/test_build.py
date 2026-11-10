@@ -142,6 +142,42 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(len(files), 12)
             self.assertFalse(any(p.suffix == '.pdb' or p.name == 'Humanizer.resources.dll' for p in files))
 
+    def test_resume_requires_an_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            with self.assertRaisesRegex(ValueError, 'no 2.3.0 extraction to resume from'):
+                build.resume(work, work / 'source', 'en-US')
+
+    def test_resume_rejects_modified_originals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            extracted = work / f'input/{build.TITLE}_build/extract/v458752'
+            (extracted / 'RomFS').mkdir(parents=True)
+            (extracted / 'control.nacp').write_bytes(bytes(0x4000))
+            (extracted / 'ExeFS').mkdir()
+            for name in ('main', 'subsdk0', 'sdk'):
+                (extracted / 'ExeFS' / name).write_bytes(b'NSO0' + bytes(100))
+            with self.assertRaisesRegex(ValueError, 'original ExeFS hash mismatch'):
+                build.resume(work, work / 'source', 'en-US')
+
+    def test_resume_takes_no_original_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ['build_jamboree.py', '--resume', '--keys', str(Path(tmp) / 'prod.keys'),
+                    '--work-dir', tmp, '--output', str(Path(tmp) / 'out.app')]
+            with mock.patch.object(sys, 'argv', argv), mock.patch('sys.stderr'):
+                with self.assertRaises(SystemExit):
+                    build.main()
+
+    def test_game_tree_copy_preserves_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / 'RomFS', Path(tmp) / 'app/RomFS'
+            (src / 'Layout').mkdir(parents=True)
+            (src / 'Layout/a.bin').write_bytes(b'synthetic')
+            dst.parent.mkdir()
+            build.copy_game_tree(src, dst)
+            self.assertEqual((dst / 'Layout/a.bin').read_bytes(), b'synthetic')
+            self.assertFalse((dst / 'RomFS').exists())
+
     def test_shader_map_has_no_original_paths(self):
         rows = [line.split('\t') for line in (GAME / f'runtime/games/{build.TITLE}/shader_map.tsv').read_text().splitlines()
                 if line and not line.startswith('#')]
